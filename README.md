@@ -15,9 +15,52 @@ never modified.**
 ## Usage
 
     src/photohaul.py [extension] [--source PATH] [--dest PATH]
-                     [--locked | --unlocked | --all] [--dry-run]
+                     [--locked | --unlocked | --all]
+                     [--dry-run] [--rewrite] [--init-template]
 
 See `src/photohaul.py --help` for the full list of options and examples.
+
+## Metadata (copyright, creator, captions)
+
+photohaul writes all metadata to the `.xmp` sidecar — never the raw — so the
+copied file stays a byte-exact clone of the card original and re-runs stay
+idempotent. Lightroom reads these on import.
+
+**Global rights** come from an optional `~/.photohaul` config file (`key = value`,
+`#` comments). Missing file or field → simply not written:
+
+```
+creator   = Your Name                          # -> dc:creator
+copyright = © {year} Your Name / yoursite.com  # -> dc:rights  ({year} = capture year)
+credit    = Your Name/yoursite.com             # default caption byline
+```
+
+**Per-shoot captions** come from a `photohaul.json` in the destination folder,
+auto-detected on ingest. Scaffold a blank one with `photohaul --init-template`:
+
+```json
+{
+  "teamA": "",
+  "teamB": "",
+  "event": "",
+  "venue": "",
+  "location": "",
+  "credit": ""
+}
+```
+
+Blank fields are omitted. A fully filled template yields, in `dc:description`:
+
+> Team A vs Team B, Event, at Venue, City, ST on May 30, 2026. Photo by Your Name/yoursite.com.
+
+(`date` is auto-filled per frame; `credit` falls back to the config `credit`,
+then `creator`.)
+
+Sidecars are **create-if-absent** by default. `photohaul --rewrite` re-applies
+them to frames already present, **merging** only photohaul's fields (label,
+copyright, creator, caption) and preserving everything else — e.g. Lightroom
+develop edits. An existing sidecar that can't be parsed is reported and left
+untouched, never overwritten.
 
 ## Requirements
 
@@ -28,4 +71,6 @@ flag that the exFAT driver maps the camera's protect bit onto.
 
 ## Design
 
-See [docs/PLAN.md](docs/PLAN.md).
+Design notes live in [`docs/`](docs/) as dated, per-topic plan documents
+(`YYYYMMDD_<topic>_plan.md`), so the directory reads as a chronological record
+of how the design evolved.

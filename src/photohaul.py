@@ -7,16 +7,22 @@
 # so names are identical no matter which subset is copied -> safe partial/repeat runs).
 # In-camera "locked" frames (the FAT read-only bit, surfaced on macOS as the uchg flag)
 # are detected, copied unlocked, and marked Purple for Lightroom via an .xmp sidecar.
+# Copyright/creator (from ~/.photohaul) and a per-folder caption template
+# (photohaul.json) are written to the same sidecar. The raw is never modified, so its
+# size always matches the card original and re-runs stay idempotent.
 #
 # Read-only on the source: the card is never modified.
 # Zero dependencies: stdlib only.
 
 import argparse
+import calendar
+import json
 import os
 import stat
 import struct
 import sys
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 
 IS_TTY = sys.stdout.isatty()
@@ -156,33 +162,232 @@ def scan_source(card, ext):
 
 
 # ---------------------------------------------------------------------------
-# XMP sidecar
+# Config (~/.photohaul) and caption template (photohaul.json)
 # ---------------------------------------------------------------------------
 
-XMP_TEMPLATE = (
-    '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
-    '<x:xmpmeta xmlns:x="adobe:ns:meta/">\n'
-    ' <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">\n'
-    '  <rdf:Description rdf:about=""\n'
-    '    xmlns:xmp="http://ns.adobe.com/xap/1.0/"\n'
-    '    xmp:Label="%s"/>\n'
-    ' </rdf:RDF>\n'
-    '</x:xmpmeta>\n'
-    '<?xpacket end="w"?>\n'
-)
+CONFIG_PATH   = os.path.expanduser('~/.photohaul')
+TEMPLATE_NAME = 'photohaul.json'
+TEMPLATE_KEYS = ['teamA', 'teamB', 'event', 'venue', 'location', 'credit']
 
 
-def write_sidecar(dest_raw, label):
-    """Create BASENAME.xmp next to the raw, only if no sidecar exists yet.
+def load_config(path=CONFIG_PATH):
+    """Parse ~/.photohaul (key = value, # comments). Missing file -> empty dict."""
+    cfg = {}
+    try:
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                s = line.strip()
+                if not s or s.startswith('#') or '=' not in line:
+                    continue
+                key, _, val = line.partition('=')
+                cfg[key.strip().lower()] = val.strip()
+    except FileNotFoundError:
+        pass
+    return cfg
 
-    Never overwrites an existing sidecar - it may hold Lightroom develop edits.
-    Returns True if written.
+
+def load_template(dest_dir):
+    """Load photohaul.json from dest_dir, or None if absent. Exits on bad JSON."""
+    path = os.path.join(dest_dir, TEMPLATE_NAME)
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as e:
+        sys.exit("Error: %s is not valid JSON (%s)" % (path, e))
+    if not isinstance(data, dict):
+        sys.exit("Error: %s must be a JSON object" % path)
+    return data
+
+
+def write_template(dest_dir):
+    """Scaffold a blank photohaul.json (one field per line) into dest_dir."""
+    if not os.path.isdir(dest_dir):
+        sys.exit("Error: destination %s is not a directory" % dest_dir)
+    path = os.path.join(dest_dir, TEMPLATE_NAME)
+    if os.path.exists(path):
+        sys.exit("Error: %s already exists; not overwriting." % path)
+    lines = ['{']
+    for i, key in enumerate(TEMPLATE_KEYS):
+        tail = ',' if i < len(TEMPLATE_KEYS) - 1 else ''
+        lines.append('  "%s": ""%s' % (key, tail))
+    lines.append('}')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+    print('Wrote blank caption template: %s' % path)
+
+
+def capture_year(captured):
+    """'2026:05:26 14:00:24' -> '2026'."""
+    return captured.split(':', 1)[0]
+
+
+def caption_date(captured):
+    """'2026:05:26 14:00:24' -> 'May 26, 2026'."""
+    y, m, d = (int(x) for x in captured.split(' ', 1)[0].split(':'))
+    return '%s %d, %d' % (calendar.month_name[m], d, y)
+
+
+def build_caption(template, date_str, config):
+    """Assemble a caption from the template, omitting any blank field.
+
+    Date attaches to the end of the context sentence; the 'Photo by' byline is
+    only added when there is real context (so an empty template yields nothing).
     """
-    sidecar = os.path.splitext(dest_raw)[0] + '.xmp'
-    if os.path.exists(sidecar):
+    def g(key):
+        v = template.get(key)
+        return v.strip() if isinstance(v, str) else ''
+
+    parts = []
+    if g('teamA') and g('teamB'):
+        parts.append('%s vs %s' % (g('teamA'), g('teamB')))
+    if g('event'):
+        parts.append(g('event'))
+    place = []
+    if g('venue'):
+        place.append('at ' + g('venue'))
+    if g('location'):
+        place.append(g('location'))
+    if place:
+        parts.append(', '.join(place))
+
+    sentence = ', '.join(parts)
+    if sentence and date_str:
+        sentence += ' on ' + date_str
+
+    credit = g('credit') or config.get('credit', '') or config.get('creator', '')
+    out = []
+    if sentence:
+        out.append(sentence + '.')
+        if credit:
+            out.append('Photo by %s.' % credit)
+    return ' '.join(out)
+
+
+# ---------------------------------------------------------------------------
+# XMP sidecar (build fresh or merge into existing; option B)
+# ---------------------------------------------------------------------------
+
+XMP_NS = {
+    'x':   'adobe:ns:meta/',
+    'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
+    'xmp': 'http://ns.adobe.com/xap/1.0/',
+    'dc':  'http://purl.org/dc/elements/1.1/',
+}
+# Register the prefixes we write, plus the common Adobe/Lightroom ones, so that
+# when we merge into an existing sidecar its other properties (e.g. develop edits)
+# round-trip with their conventional prefixes instead of ET's auto "ns0/ns1".
+_EXTRA_NS = {
+    'crs':          'http://ns.adobe.com/camera-raw-settings/1.0/',
+    'photoshop':    'http://ns.adobe.com/photoshop/1.0/',
+    'tiff':         'http://ns.adobe.com/tiff/1.0/',
+    'exif':         'http://ns.adobe.com/exif/1.0/',
+    'aux':          'http://ns.adobe.com/exif/1.0/aux/',
+    'lr':           'http://ns.adobe.com/lightroom/1.0/',
+    'xmpMM':        'http://ns.adobe.com/xap/1.0/mm/',
+    'xmpRights':    'http://ns.adobe.com/xap/1.0/rights/',
+    'stEvt':        'http://ns.adobe.com/xap/1.0/sType/ResourceEvent#',
+    'stRef':        'http://ns.adobe.com/xap/1.0/sType/ResourceRef#',
+    'Iptc4xmpCore': 'http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/',
+    'Iptc4xmpExt':  'http://iptc.org/std/Iptc4xmpExt/2008-02-29/',
+}
+for _p, _u in {**XMP_NS, **_EXTRA_NS}.items():
+    ET.register_namespace(_p, _u)
+_XML_LANG = '{http://www.w3.org/XML/1998/namespace}lang'
+
+_SKELETON = (
+    '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+    '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+    '<rdf:Description rdf:about="" '
+    'xmlns:xmp="http://ns.adobe.com/xap/1.0/" '
+    'xmlns:dc="http://purl.org/dc/elements/1.1/"/>'
+    '</rdf:RDF></x:xmpmeta>'
+)
+_XPACKET_HEAD = '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+_XPACKET_TAIL = '\n<?xpacket end="w"?>\n'
+
+
+class SidecarParseError(Exception):
+    """An existing sidecar could not be parsed; caller should warn and leave it."""
+
+
+def _q(prefix, local):
+    return '{%s}%s' % (XMP_NS[prefix], local)
+
+
+def _clear_prop(descs, qname):
+    """Remove a property in either attribute or element form from all Descriptions."""
+    for d in descs:
+        d.attrib.pop(qname, None)
+        for child in list(d):
+            if child.tag == qname:
+                d.remove(child)
+
+
+def _set_label(desc, value):
+    ET.SubElement(desc, _q('xmp', 'Label')).text = value
+
+
+def _set_seq(desc, qname, value):
+    seq = ET.SubElement(ET.SubElement(desc, qname), _q('rdf', 'Seq'))
+    ET.SubElement(seq, _q('rdf', 'li')).text = value
+
+
+def _set_alt(desc, qname, value):
+    alt = ET.SubElement(ET.SubElement(desc, qname), _q('rdf', 'Alt'))
+    li = ET.SubElement(alt, _q('rdf', 'li'))
+    li.set(_XML_LANG, 'x-default')
+    li.text = value
+
+
+def write_sidecar(sidecar, fields, merge):
+    """Write our XMP properties into `sidecar`.
+
+    fields: {'label','rights','creator','description'} (falsy = leave unset).
+    merge=False -> create-if-absent (an existing sidecar is left untouched).
+    merge=True  -> set only our properties, preserving everything else (e.g.
+                   Lightroom develop edits).
+    Returns True if written. Raises SidecarParseError if an existing sidecar
+    can't be parsed - we never clobber it.
+    """
+    if not any(fields.values()):
         return False
-    with open(sidecar, 'w', encoding='utf-8') as f:
-        f.write(XMP_TEMPLATE % label)
+    exists = os.path.exists(sidecar)
+    if exists and not merge:
+        return False
+    if exists:
+        try:
+            root = ET.parse(sidecar).getroot()
+        except ET.ParseError as e:
+            raise SidecarParseError('unparseable sidecar, left as-is (%s)' % e)
+    else:
+        root = ET.fromstring(_SKELETON)
+
+    descs = root.findall('.//' + _q('rdf', 'Description'))
+    if not descs:
+        raise SidecarParseError('no rdf:Description, left as-is')
+    target = descs[0]
+
+    # Replace only the properties we own; never remove a label we aren't setting.
+    if fields.get('label'):
+        _clear_prop(descs, _q('xmp', 'Label'))
+        _set_label(target, fields['label'])
+    if fields.get('rights'):
+        _clear_prop(descs, _q('dc', 'rights'))
+        _set_alt(target, _q('dc', 'rights'), fields['rights'])
+    if fields.get('creator'):
+        _clear_prop(descs, _q('dc', 'creator'))
+        _set_seq(target, _q('dc', 'creator'), fields['creator'])
+    if fields.get('description'):
+        _clear_prop(descs, _q('dc', 'description'))
+        _set_alt(target, _q('dc', 'description'), fields['description'])
+
+    body = ET.tostring(root, encoding='unicode')
+    tmp = sidecar + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(_XPACKET_HEAD + body + _XPACKET_TAIL)
+    os.replace(tmp, sidecar)
     return True
 
 
@@ -299,6 +504,7 @@ class Frame:
     size: int
     locked: bool
     dest: str
+    captured: str          # Exif datetime, e.g. '2026:05:26 14:00:24'
 
     @property
     def sidecar(self):
@@ -313,6 +519,9 @@ class Haul:
     dest_dir: str
     filt: str
     dry_run: bool
+    rewrite: bool
+    config: dict
+    template: dict          # None if no photohaul.json present
 
     frames: list = field(default_factory=list)      # frames passing the filter
     featured: int = 0                               # locked frames seen (pre-filter)
@@ -352,7 +561,7 @@ class Haul:
             else:
                 used_names[base] = 1
             dest = os.path.join(self.dest_dir, base + '.' + self.ext)
-            self.frames.append(Frame(src, os.path.getsize(src), locked, dest))
+            self.frames.append(Frame(src, os.path.getsize(src), locked, dest, dt))
 
     def classify(self):
         """Split planned frames into copy / skip (already present) / conflict."""
@@ -376,6 +585,14 @@ class Haul:
         print('Featured: %d   Total: %d (%d to copy, %d skipped%s)'
               % (self.featured, len(self.frames), len(self.to_copy), len(self.to_skip),
                  (', %d CONFLICT' % len(self.conflicts)) if self.conflicts else ''))
+        meta = []
+        if self.config.get('copyright') or self.config.get('creator'):
+            meta.append('rights')
+        if self.template is not None:
+            meta.append('caption')
+        if meta:
+            print('Metadata: %s%s' % (', '.join(meta),
+                                      ' (rewrite/merge)' if self.rewrite else ''))
         if self.errors:
             print('  %d file(s) skipped - unreadable Exif:' % len(self.errors))
             for e in self.errors:
@@ -400,13 +617,46 @@ class Haul:
         progress.finish()
         return progress
 
-    def mark_featured(self):
-        """Tag locked frames Purple via sidecar (create-if-absent). Returns count."""
-        marked = 0
+    def fields_for(self, frame):
+        """The sidecar properties this frame should carry, given config + template."""
+        rights = None
+        if self.config.get('copyright'):
+            rights = self.config['copyright'].replace('{year}',
+                                                       capture_year(frame.captured))
+        description = None
+        if self.template is not None:
+            description = build_caption(self.template, caption_date(frame.captured),
+                                        self.config) or None
+        return {
+            'label':       'Purple' if frame.locked else None,
+            'rights':      rights,
+            'creator':     self.config.get('creator') or None,
+            'description': description,
+        }
+
+    def would_write(self, frame):
+        """For a frame, whether a sidecar would be written and if it's a Purple one."""
+        fields = self.fields_for(frame)
+        if not any(fields.values()):
+            return None
+        if os.path.exists(frame.sidecar) and not self.rewrite:
+            return None
+        return bool(fields['label'])
+
+    def write_metadata(self):
+        """Write sidecars (create-if-absent, or merge under --rewrite). Returns counts."""
+        written = purple = 0
         for f in self.frames:
-            if f.locked and os.path.exists(f.dest) and write_sidecar(f.dest, 'Purple'):
-                marked += 1
-        return marked
+            if not os.path.exists(f.dest):
+                continue   # copy failed earlier
+            try:
+                if write_sidecar(f.sidecar, self.fields_for(f), merge=self.rewrite):
+                    written += 1
+                    if f.locked:
+                        purple += 1
+            except SidecarParseError as e:
+                self.errors.append('%s: %s' % (os.path.basename(f.sidecar), e))
+        return written, purple
 
     # --- orchestration -------------------------------------------------------
 
@@ -416,18 +666,20 @@ class Haul:
         self.report_plan()
 
         if self.dry_run:
-            marks = sum(1 for f in self.frames
-                        if f.locked and not os.path.exists(f.sidecar))
-            print('Dry run: would copy %s, mark %d Purple. Nothing written.'
-                  % (human_bytes(self.copy_bytes), marks))
+            planned = [self.would_write(f) for f in self.frames]
+            wcount = sum(1 for p in planned if p is not None)
+            pcount = sum(1 for p in planned if p)
+            print('Dry run: would copy %s, write %d sidecars (%d Purple). '
+                  'Nothing written.' % (human_bytes(self.copy_bytes), wcount, pcount))
             return self._exit_code()
 
         progress = self.copy()
-        marked = self.mark_featured()
-        print('Done: copied %d (%s in %s, %.0f MB/s), skipped %d, marked %d Purple.'
+        written, purple = self.write_metadata()
+        print('Done: copied %d (%s in %s, %.0f MB/s), skipped %d. '
+              'Sidecars: %d written (%d Purple).'
               % (progress.done_files, human_bytes(progress.done_bytes),
                  fmt_eta(progress.elapsed), progress.rate_mb,
-                 len(self.to_skip), marked))
+                 len(self.to_skip), written, purple))
         if self.errors:
             print('  %d error(s):' % len(self.errors))
             for e in self.errors:
@@ -455,21 +707,36 @@ def build_parser():
             '\n'
             'Frames locked (protected) in-camera are detected, copied unlocked, and\n'
             'tagged with a Purple color label for Lightroom via an .xmp sidecar.\n'
-            'The card is never modified.'),
+            'Copyright/creator (from ~/.photohaul) and a per-folder caption template\n'
+            '(photohaul.json) are written to that sidecar too. The card is never\n'
+            'modified, and the raw stays a byte-exact clone of the card original.'),
         epilog=(
             'examples:\n'
             '  photohaul                    # copy all ARW from the card into cwd\n'
             '  photohaul --dry-run          # show what would happen, touch nothing\n'
             '  photohaul --locked           # only the featured (locked) frames\n'
             '  photohaul jpg                # ingest .JPG instead of .ARW\n'
+            '  photohaul --init-template    # scaffold a blank photohaul.json here\n'
+            '  photohaul --rewrite          # re-apply label/copyright/caption sidecars\n'
             '  photohaul --source /Volumes/Untitled --dest ~/Photos/game\n'
+            '\n'
+            'config file (~/.photohaul, optional, "key = value", # comments):\n'
+            '  creator   = Your Name              -> dc:creator\n'
+            '  copyright = (c) {year} Your Name   -> dc:rights ({year} = capture year)\n'
+            '  credit    = Your Name/site.com     -> default caption byline\n'
+            '\n'
+            'caption template (photohaul.json in the destination, auto-detected):\n'
+            '  keys: teamA, teamB, event, venue, location, credit (blanks omitted).\n'
+            '  --> "Team A vs Team B, Event, at Venue, City, ST on May 30, 2026.\n'
+            '       Photo by Your Name/site.com."\n'
             '\n'
             'notes:\n'
             '  - The card is read-only here; it is never written to or modified.\n'
             '  - A same-named file of matching size is skipped; one of different size\n'
             '    is reported as a conflict and never overwritten.\n'
-            '  - A sidecar is only created if no .xmp exists yet, so existing edits\n'
-            '    are never clobbered.'))
+            '  - Sidecars are create-if-absent; --rewrite merges our fields into an\n'
+            '    existing sidecar (label, copyright, creator, caption) and preserves\n'
+            '    everything else, e.g. Lightroom develop edits.'))
     ap.add_argument('extension', nargs='?', default='arw',
                     help='file extension to ingest (default: arw)')
     ap.add_argument('--source', help='card root (default: auto-detect under /Volumes)')
@@ -483,6 +750,11 @@ def build_parser():
                      help='ingest everything (default)')
     ap.add_argument('-n', '--dry-run', action='store_true',
                     help='scan and report; touch nothing')
+    ap.add_argument('--rewrite', action='store_true',
+                    help='re-apply sidecar metadata to frames already present (merges '
+                         'our fields into existing sidecars; preserves the rest)')
+    ap.add_argument('--init-template', action='store_true',
+                    help='write a blank %s into the destination and exit' % TEMPLATE_NAME)
     ap.set_defaults(filter='all')
     return ap
 
@@ -491,14 +763,21 @@ def main():
     args = build_parser().parse_args()
 
     ext = args.extension.lstrip('.')
-    card = find_card(args.source)
     dest_dir = os.path.abspath(args.dest)
+
+    if args.init_template:
+        write_template(dest_dir)
+        return 0
+
+    card = find_card(args.source)
     if not args.dry_run and not os.path.isdir(dest_dir):
         sys.exit("Error: destination %s is not a directory" % dest_dir)
     if not scan_source(card, ext):
         sys.exit("Error: no .%s files found under %s/DCIM" % (ext, card))
 
-    return Haul(card, ext, dest_dir, args.filter, args.dry_run).run()
+    return Haul(card=card, ext=ext, dest_dir=dest_dir, filt=args.filter,
+                dry_run=args.dry_run, rewrite=args.rewrite,
+                config=load_config(), template=load_template(dest_dir)).run()
 
 
 if __name__ == '__main__':
