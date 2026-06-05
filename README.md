@@ -26,20 +26,32 @@ photohaul writes all metadata to the `.xmp` sidecar — never the raw — so the
 copied file stays a byte-exact clone of the card original and re-runs stay
 idempotent. Lightroom reads these on import.
 
-**Global rights** come from an optional `~/.photohaul` config file (`key = value`,
-`#` comments). Missing file or field → simply not written:
+**Rights** come from an optional `~/.photohaul` config file (INI). Keys in
+`[default]` are inherited by every profile; a profile section overrides or adds.
+Missing file or field → simply not written:
 
+```ini
+[default]
+creator   = Your Name              ; -> dc:creator
+copyright = © {year} Your Name     ; -> dc:rights  ({year} = capture year)
+
+[work]
+copyright = © {year} Your Name / yoursite.com
+credit    = Your Name/yoursite.com ; default caption byline
 ```
-creator   = Your Name                          # -> dc:creator
-copyright = © {year} Your Name / yoursite.com  # -> dc:rights  ({year} = capture year)
-credit    = Your Name/yoursite.com             # default caption byline
-```
+
+**Profiles** let one camera serve multiple contexts (e.g. personal vs work)
+with different rights. The active profile is chosen by, in order: `--profile NAME`,
+then a `"profile"` key in the folder's `photohaul.json`, then `[default]`. A folder
+with no template stays on `[default]` — so personal shots never pick up the
+branded copyright. (A section-less legacy config is read as `[default]`.)
 
 **Per-shoot captions** come from a `photohaul.json` in the destination folder,
 auto-detected on ingest. Scaffold a blank one with `photohaul --init-template`:
 
 ```json
 {
+  "profile": "",
   "teamA": "",
   "teamB": "",
   "event": "",
@@ -49,7 +61,9 @@ auto-detected on ingest. Scaffold a blank one with `photohaul --init-template`:
 }
 ```
 
-Blank fields are omitted. A fully filled template yields, in `dc:description`:
+Blank fields are omitted from the caption (`profile` selects the rights preset
+and is not part of the caption text). A fully filled template yields, in
+`dc:description`:
 
 > Team A vs Team B, Event, at Venue, City, ST on May 30, 2026. Photo by Your Name/yoursite.com.
 

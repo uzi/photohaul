@@ -1,6 +1,8 @@
 # Plan: global config file (`~/.photohaul`)
 
-Status: implemented (2026-06-05)
+Status: implemented (2026-06-05); file format later revised — see
+[[20260605_profiles_plan]] (flat `key = value` → INI sections/profiles). The
+fields, `{year}` token, and sidecar mapping below still apply.
 
 ## Purpose
 Hold the user's *global rights defaults* — the stuff that rarely changes and

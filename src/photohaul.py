@@ -16,6 +16,7 @@
 
 import argparse
 import calendar
+import configparser
 import json
 import os
 import stat
@@ -165,25 +166,36 @@ def scan_source(card, ext):
 # Config (~/.photohaul) and caption template (photohaul.json)
 # ---------------------------------------------------------------------------
 
-CONFIG_PATH   = os.path.expanduser('~/.photohaul')
-TEMPLATE_NAME = 'photohaul.json'
-TEMPLATE_KEYS = ['teamA', 'teamB', 'event', 'venue', 'location', 'credit']
+CONFIG_PATH     = os.path.expanduser('~/.photohaul')
+TEMPLATE_NAME   = 'photohaul.json'
+TEMPLATE_KEYS   = ['teamA', 'teamB', 'event', 'venue', 'location', 'credit']
+DEFAULT_PROFILE = 'default'
 
 
-def load_config(path=CONFIG_PATH):
-    """Parse ~/.photohaul (key = value, # comments). Missing file -> empty dict."""
-    cfg = {}
+def load_config(profile=None, path=CONFIG_PATH):
+    """Resolve rights from ~/.photohaul (INI; [default] is inherited by profiles).
+
+    profile=None (or 'default') -> the [default] keys only. A named profile is
+    merged over [default]. Missing file -> empty dict. Exits if a named profile
+    is absent. A section-less (legacy flat) file is treated as [default].
+    """
+    parser = configparser.ConfigParser(default_section=DEFAULT_PROFILE,
+                                        interpolation=None)
     try:
         with open(path, encoding='utf-8') as f:
-            for line in f:
-                s = line.strip()
-                if not s or s.startswith('#') or '=' not in line:
-                    continue
-                key, _, val = line.partition('=')
-                cfg[key.strip().lower()] = val.strip()
+            text = f.read()
     except FileNotFoundError:
-        pass
-    return cfg
+        return {}
+    try:
+        parser.read_string(text)
+    except configparser.MissingSectionHeaderError:
+        parser.read_string('[%s]\n%s' % (DEFAULT_PROFILE, text))
+
+    if profile and profile != DEFAULT_PROFILE:
+        if not parser.has_section(profile):
+            sys.exit("Error: profile '%s' not found in %s" % (profile, path))
+        return dict(parser[profile])
+    return dict(parser.defaults())
 
 
 def load_template(dest_dir):
@@ -208,9 +220,10 @@ def write_template(dest_dir):
     path = os.path.join(dest_dir, TEMPLATE_NAME)
     if os.path.exists(path):
         sys.exit("Error: %s already exists; not overwriting." % path)
+    keys = ['profile'] + TEMPLATE_KEYS
     lines = ['{']
-    for i, key in enumerate(TEMPLATE_KEYS):
-        tail = ',' if i < len(TEMPLATE_KEYS) - 1 else ''
+    for i, key in enumerate(keys):
+        tail = ',' if i < len(keys) - 1 else ''
         lines.append('  "%s": ""%s' % (key, tail))
     lines.append('}')
     with open(path, 'w', encoding='utf-8') as f:
@@ -522,6 +535,7 @@ class Haul:
     rewrite: bool
     config: dict
     template: dict          # None if no photohaul.json present
+    profile: str            # active profile name (DEFAULT_PROFILE if none)
 
     frames: list = field(default_factory=list)      # frames passing the filter
     featured: int = 0                               # locked frames seen (pre-filter)
@@ -585,6 +599,8 @@ class Haul:
         print('Featured: %d   Total: %d (%d to copy, %d skipped%s)'
               % (self.featured, len(self.frames), len(self.to_copy), len(self.to_skip),
                  (', %d CONFLICT' % len(self.conflicts)) if self.conflicts else ''))
+        if self.profile != DEFAULT_PROFILE:
+            print('Profile: %s' % self.profile)
         meta = []
         if self.config.get('copyright') or self.config.get('creator'):
             meta.append('rights')
@@ -718,15 +734,23 @@ def build_parser():
             '  photohaul jpg                # ingest .JPG instead of .ARW\n'
             '  photohaul --init-template    # scaffold a blank photohaul.json here\n'
             '  photohaul --rewrite          # re-apply label/copyright/caption sidecars\n'
+            '  photohaul --profile personal # apply a named rights preset\n'
             '  photohaul --source /Volumes/Untitled --dest ~/Photos/game\n'
             '\n'
-            'config file (~/.photohaul, optional, "key = value", # comments):\n'
+            'config file (~/.photohaul, optional, INI; [default] inherited by profiles):\n'
+            '  [default]\n'
             '  creator   = Your Name              -> dc:creator\n'
             '  copyright = (c) {year} Your Name   -> dc:rights ({year} = capture year)\n'
+            '  [work]\n'
+            '  copyright = (c) {year} Your Name / site.com\n'
             '  credit    = Your Name/site.com     -> default caption byline\n'
             '\n'
+            'profile: --profile NAME, else "profile" in photohaul.json, else [default].\n'
+            '  A folder with no template stays on [default] (e.g. personal, unbranded).\n'
+            '\n'
             'caption template (photohaul.json in the destination, auto-detected):\n'
-            '  keys: teamA, teamB, event, venue, location, credit (blanks omitted).\n'
+            '  keys: profile, teamA, teamB, event, venue, location, credit (blanks\n'
+            '  omitted from the caption).\n'
             '  --> "Team A vs Team B, Event, at Venue, City, ST on May 30, 2026.\n'
             '       Photo by Your Name/site.com."\n'
             '\n'
@@ -755,6 +779,9 @@ def build_parser():
                          'our fields into existing sidecars; preserves the rest)')
     ap.add_argument('--init-template', action='store_true',
                     help='write a blank %s into the destination and exit' % TEMPLATE_NAME)
+    ap.add_argument('--profile',
+                    help='rights profile from ~/.photohaul (overrides the template); '
+                         'default falls back to the "profile" key in %s' % TEMPLATE_NAME)
     ap.set_defaults(filter='all')
     return ap
 
@@ -775,9 +802,12 @@ def main():
     if not scan_source(card, ext):
         sys.exit("Error: no .%s files found under %s/DCIM" % (ext, card))
 
+    template = load_template(dest_dir)
+    profile = args.profile or (template or {}).get('profile') or DEFAULT_PROFILE
     return Haul(card=card, ext=ext, dest_dir=dest_dir, filt=args.filter,
                 dry_run=args.dry_run, rewrite=args.rewrite,
-                config=load_config(), template=load_template(dest_dir)).run()
+                config=load_config(profile), template=template,
+                profile=profile).run()
 
 
 if __name__ == '__main__':
