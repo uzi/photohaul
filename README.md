@@ -70,11 +70,14 @@ and is not part of the caption text). A fully filled template yields, in
 (`date` is auto-filled per frame; `credit` falls back to the config `credit`,
 then `creator`.)
 
-Sidecars are **create-if-absent** by default. `photohaul --rewrite` re-applies
-them to frames already present, **merging** only photohaul's fields (label,
-copyright, creator, caption) and preserving everything else — e.g. Lightroom
-develop edits. An existing sidecar that can't be parsed is reported and left
-untouched, never overwritten.
+Sidecars are **create-if-absent** by default. `photohaul --rewrite` refreshes
+them on files **already in the destination** — no card is needed and nothing is
+copied. It **merges** only photohaul's fields (copyright, creator, caption),
+preserving everything else (e.g. Lightroom develop edits). An existing **Purple
+label is kept as-is**; because lock status is only known from the card, rewrite
+never adds or removes a label. An existing sidecar that can't be parsed is
+reported and left untouched, never overwritten. `--rewrite` cannot be combined
+with `--locked`/`--unlocked`.
 
 ## Requirements
 

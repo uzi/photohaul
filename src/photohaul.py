@@ -354,6 +354,28 @@ def _set_alt(desc, qname, value):
     li.text = value
 
 
+def read_label(sidecar):
+    """Return the xmp:Label of an existing sidecar (attribute or element form), else None.
+
+    Used only for reporting under --rewrite, so we can say how many Purple sidecars
+    were preserved. A missing or unparseable sidecar reads as None.
+    """
+    if not os.path.exists(sidecar):
+        return None
+    try:
+        root = ET.parse(sidecar).getroot()
+    except ET.ParseError:
+        return None
+    qname = _q('xmp', 'Label')
+    for d in root.findall('.//' + _q('rdf', 'Description')):
+        if qname in d.attrib:
+            return d.attrib[qname] or None
+        for child in d:
+            if child.tag == qname:
+                return (child.text or '').strip() or None
+    return None
+
+
 def write_sidecar(sidecar, fields, merge):
     """Write our XMP properties into `sidecar`.
 
@@ -553,6 +575,8 @@ class Haul:
         On the (near-impossible, single-body) chance two frames map to one name, fall
         back to the intrinsic DSC file number rather than ever risk an overwrite.
         """
+        if self.rewrite:
+            return self.scan_dest()
         used_names = {}
         for src in scan_source(self.card, self.ext):
             locked = is_locked(src)
@@ -577,6 +601,27 @@ class Haul:
             dest = os.path.join(self.dest_dir, base + '.' + self.ext)
             self.frames.append(Frame(src, os.path.getsize(src), locked, dest, dt))
 
+    def scan_dest(self):
+        """Card-free scan for --rewrite: find already-copied files in the destination
+        and read their Exif so rights/caption can be recomputed. The card is never
+        touched; an existing Purple label is read only for reporting, never changed.
+        """
+        suffix = '.' + self.ext.lower()
+        names = sorted(n for n in os.listdir(self.dest_dir)
+                       if n.lower().endswith(suffix))
+        for name in names:
+            dest = os.path.join(self.dest_dir, name)
+            try:
+                dt, _sub = read_exif_datetime(dest)
+            except (ValueError, OSError) as e:
+                self.errors.append('%s: cannot read Exif (%s)' % (name, e))
+                continue
+            frame = Frame(dest, os.path.getsize(dest), False, dest, dt)
+            if read_label(frame.sidecar) == 'Purple':   # preserved as-is; reporting only
+                frame.locked = True
+                self.featured += 1
+            self.frames.append(frame)
+
     def classify(self):
         """Split planned frames into copy / skip (already present) / conflict."""
         for f in self.frames:
@@ -594,11 +639,15 @@ class Haul:
     # --- reporting -----------------------------------------------------------
 
     def report_plan(self):
-        print('Card: %s   Extension: .%s   Filter: %s'
-              % (self.card, self.ext, self.filt))
-        print('Featured: %d   Total: %d (%d to copy, %d skipped%s)'
-              % (self.featured, len(self.frames), len(self.to_copy), len(self.to_skip),
-                 (', %d CONFLICT' % len(self.conflicts)) if self.conflicts else ''))
+        if self.rewrite:
+            print('Rewrite: %s   Extension: .%s' % (self.dest_dir, self.ext))
+            print('Files: %d (%d Purple preserved)' % (len(self.frames), self.featured))
+        else:
+            print('Card: %s   Extension: .%s   Filter: %s'
+                  % (self.card, self.ext, self.filt))
+            print('Featured: %d   Total: %d (%d to copy, %d skipped%s)'
+                  % (self.featured, len(self.frames), len(self.to_copy), len(self.to_skip),
+                     (', %d CONFLICT' % len(self.conflicts)) if self.conflicts else ''))
         if self.profile != DEFAULT_PROFILE:
             print('Profile: %s' % self.profile)
         meta = []
@@ -644,7 +693,9 @@ class Haul:
             description = build_caption(self.template, caption_date(frame.captured),
                                         self.config) or None
         return {
-            'label':       'Purple' if frame.locked else None,
+            # Under --rewrite we never set a label: write_sidecar(merge) leaves any
+            # existing Purple untouched, and we can't know lock status without the card.
+            'label':       None if self.rewrite else ('Purple' if frame.locked else None),
             'rights':      rights,
             'creator':     self.config.get('creator') or None,
             'description': description,
@@ -657,7 +708,8 @@ class Haul:
             return None
         if os.path.exists(frame.sidecar) and not self.rewrite:
             return None
-        return bool(fields['label'])
+        # In rewrite mode we never set a label, but report any preserved Purple.
+        return frame.locked if self.rewrite else bool(fields['label'])
 
     def write_metadata(self):
         """Write sidecars (create-if-absent, or merge under --rewrite). Returns counts."""
@@ -678,8 +730,12 @@ class Haul:
 
     def run(self):
         self.scan()
-        self.classify()
+        if not self.rewrite:
+            self.classify()
         self.report_plan()
+
+        if self.rewrite:
+            return self.run_rewrite()
 
         if self.dry_run:
             planned = [self.would_write(f) for f in self.frames]
@@ -696,6 +752,24 @@ class Haul:
               % (progress.done_files, human_bytes(progress.done_bytes),
                  fmt_eta(progress.elapsed), progress.rate_mb,
                  len(self.to_skip), written, purple))
+        if self.errors:
+            print('  %d error(s):' % len(self.errors))
+            for e in self.errors:
+                print('    ! ' + e)
+        return self._exit_code()
+
+    def run_rewrite(self):
+        """Metadata-only refresh of the destination: no card, no copying."""
+        if self.dry_run:
+            planned = [self.would_write(f) for f in self.frames]
+            wcount = sum(1 for p in planned if p is not None)
+            pcount = sum(1 for p in planned if p)
+            print('Dry run: would write %d sidecars (%d Purple preserved). '
+                  'Nothing written.' % (wcount, pcount))
+            return self._exit_code()
+
+        written, purple = self.write_metadata()
+        print('Done: rewrote %d sidecars (%d Purple preserved).' % (written, purple))
         if self.errors:
             print('  %d error(s):' % len(self.errors))
             for e in self.errors:
@@ -733,7 +807,7 @@ def build_parser():
             '  photohaul --locked           # only the featured (locked) frames\n'
             '  photohaul jpg                # ingest .JPG instead of .ARW\n'
             '  photohaul --init-template    # scaffold a blank photohaul.json here\n'
-            '  photohaul --rewrite          # re-apply label/copyright/caption sidecars\n'
+            '  photohaul --rewrite          # refresh copyright/caption sidecars (no card)\n'
             '  photohaul --profile personal # apply a named rights preset\n'
             '  photohaul --source /Volumes/Untitled --dest ~/Photos/game\n'
             '\n'
@@ -759,8 +833,11 @@ def build_parser():
             '  - A same-named file of matching size is skipped; one of different size\n'
             '    is reported as a conflict and never overwritten.\n'
             '  - Sidecars are create-if-absent; --rewrite merges our fields into an\n'
-            '    existing sidecar (label, copyright, creator, caption) and preserves\n'
-            '    everything else, e.g. Lightroom develop edits.'))
+            '    existing sidecar (copyright, creator, caption) and preserves\n'
+            '    everything else, e.g. Lightroom develop edits.\n'
+            '  - --rewrite works on the destination only - no card needed and nothing\n'
+            '    copied. A Purple label already in a sidecar is kept; it is never added\n'
+            '    or removed (lock status is unknown without the card).'))
     ap.add_argument('extension', nargs='?', default='arw',
                     help='file extension to ingest (default: arw)')
     ap.add_argument('--source', help='card root (default: auto-detect under /Volumes)')
@@ -775,8 +852,10 @@ def build_parser():
     ap.add_argument('-n', '--dry-run', action='store_true',
                     help='scan and report; touch nothing')
     ap.add_argument('--rewrite', action='store_true',
-                    help='re-apply sidecar metadata to frames already present (merges '
-                         'our fields into existing sidecars; preserves the rest)')
+                    help='refresh sidecar metadata on already-copied files in the '
+                         'destination; the card is not used and nothing is copied. '
+                         'Merges our fields (rights, creator, caption) into existing '
+                         'sidecars and preserves the rest, including any Purple label')
     ap.add_argument('--init-template', action='store_true',
                     help='write a blank %s into the destination and exit' % TEMPLATE_NAME)
     ap.add_argument('--profile',
@@ -796,11 +875,21 @@ def main():
         write_template(dest_dir)
         return 0
 
-    card = find_card(args.source)
-    if not args.dry_run and not os.path.isdir(dest_dir):
-        sys.exit("Error: destination %s is not a directory" % dest_dir)
-    if not scan_source(card, ext):
-        sys.exit("Error: no .%s files found under %s/DCIM" % (ext, card))
+    if args.rewrite and args.filter != 'all':
+        sys.exit("Error: --rewrite cannot be combined with --locked/--unlocked "
+                 "(lock status isn't available without the card)")
+
+    if args.rewrite:
+        # Metadata-only refresh of the destination; the card is not used.
+        card = None
+        if not os.path.isdir(dest_dir):
+            sys.exit("Error: destination %s is not a directory" % dest_dir)
+    else:
+        card = find_card(args.source)
+        if not args.dry_run and not os.path.isdir(dest_dir):
+            sys.exit("Error: destination %s is not a directory" % dest_dir)
+        if not scan_source(card, ext):
+            sys.exit("Error: no .%s files found under %s/DCIM" % (ext, card))
 
     template = load_template(dest_dir)
     profile = args.profile or (template or {}).get('profile') or DEFAULT_PROFILE
