@@ -9,8 +9,10 @@
 # is copied -> safe partial/repeat runs).
 # In-camera "locked" frames (the FAT read-only bit, surfaced on macOS as the uchg flag)
 # are detected, copied unlocked, and marked Purple for Lightroom via an .xmp sidecar.
-# Copyright/creator (from ~/.photohaul) and a per-folder caption template
-# (photohaul.json) are written to the same sidecar. The raw is copied byte-for-byte,
+# Copyright/creator (from ~/.photohaul) and a per-folder template (photohaul.json) -
+# an AP-style caption plus structured IPTC fields (headline, credit/source,
+# city/state/country, location, usage terms, keywords) - are written to the same
+# sidecar. The raw is copied byte-for-byte,
 # the lone exception being an optional capture-time/timezone correction (photohaul.json)
 # that overwrites the copy's EXIF date/offset fields in place at the same byte length -
 # so the copy's size always matches the card original and re-runs stay idempotent.
@@ -417,9 +419,10 @@ def dsc_number(filename):
 # Lock detection (read-only on source)
 # ---------------------------------------------------------------------------
 
-def is_locked(path):
-    """True if the macOS immutable (uchg) flag is set - Sony's in-camera protect bit."""
-    return bool(getattr(os.stat(path), 'st_flags', 0) & stat.UF_IMMUTABLE)
+def is_locked(st):
+    """True if the macOS immutable (uchg) flag is set on a stat result - the in-camera
+    protect bit. Takes an os.stat_result so the caller can reuse one stat for size too."""
+    return bool(getattr(st, 'st_flags', 0) & stat.UF_IMMUTABLE)
 
 
 # ---------------------------------------------------------------------------
@@ -515,7 +518,7 @@ def load_template(dest_dir):
 
 
 def write_template(dest_dir):
-    """Scaffold a blank photohaul.json (one field per line) into dest_dir."""
+    """Scaffold a blank photohaul.json (caption/IPTC keys + corrections, one per line)."""
     if not os.path.isdir(dest_dir):
         sys.exit("Error: destination %s is not a directory" % dest_dir)
     path = os.path.join(dest_dir, TEMPLATE_NAME)
@@ -529,7 +532,7 @@ def write_template(dest_dir):
     lines.append('}')
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines) + '\n')
-    print('Wrote blank caption template: %s' % path)
+    print('Wrote blank photohaul.json template: %s' % path)
 
 
 def capture_year(captured):
@@ -935,6 +938,7 @@ class Haul:
     to_copy: list = field(default_factory=list)
     to_skip: list = field(default_factory=list)
     conflicts: list = field(default_factory=list)
+    _iptc: dict = field(default=None, init=False, repr=False)   # cached folder-constant fields
 
     # --- planning ------------------------------------------------------------
 
@@ -949,7 +953,8 @@ class Haul:
             return self.scan_dest()
         used_names = {}
         for src in scan_source(self.card, self.ext):
-            locked = is_locked(src)
+            st = os.stat(src)               # one stat for both lock bit and size
+            locked = is_locked(st)
             if locked:
                 self.featured += 1
             if self.filt == 'locked' and not locked:
@@ -974,24 +979,8 @@ class Haul:
             else:
                 used_names[base] = 1
             dest = os.path.join(self.dest_dir, base + '.' + self.ext)
-            self.frames.append(Frame(src, os.path.getsize(src), locked, dest, dt,
+            self.frames.append(Frame(src, st.st_size, locked, dest, dt,
                                      date_delta=date_delta))
-
-    def _date_delta(self, src, rec_off):
-        """Total wall-clock shift for a frame: zone_delta (from shot_tz) + time_shift.
-
-        zone_delta = shot_tz target - the frame's recorded OffsetTimeOriginal, so a
-        shot_tz correction is instant-preserving. shot_tz with no recorded offset to
-        derive from raises ExifPatchError.
-        """
-        zone_delta = timedelta(0)
-        if self.shot_tz is not None:
-            if rec_off is None:
-                raise ExifPatchError(
-                    '%s: shot_tz set but no recorded OffsetTimeOriginal to derive from'
-                    % os.path.basename(src))
-            zone_delta = self.shot_tz_delta - parse_tz(rec_off)
-        return zone_delta + self.time_shift
 
     def scan_dest(self):
         """Card-free scan for --rewrite: find already-copied files in the destination
@@ -1013,6 +1002,22 @@ class Haul:
                 frame.locked = True
                 self.featured += 1
             self.frames.append(frame)
+
+    def _date_delta(self, src, rec_off):
+        """Total wall-clock shift for a frame: zone_delta (from shot_tz) + time_shift.
+
+        zone_delta = shot_tz target - the frame's recorded OffsetTimeOriginal, so a
+        shot_tz correction is instant-preserving. shot_tz with no recorded offset to
+        derive from raises ExifPatchError.
+        """
+        zone_delta = timedelta(0)
+        if self.shot_tz is not None:
+            if rec_off is None:
+                raise ExifPatchError(
+                    '%s: shot_tz set but no recorded OffsetTimeOriginal to derive from'
+                    % os.path.basename(src))
+            zone_delta = self.shot_tz_delta - parse_tz(rec_off)
+        return zone_delta + self.time_shift
 
     def classify(self):
         """Split planned frames into copy / skip (already present) / conflict."""
@@ -1093,41 +1098,46 @@ class Haul:
         if self.config.get('copyright'):
             rights = self.config['copyright'].replace('{year}',
                                                        capture_year(frame.captured))
-        description = None
-        extra = {}
-        if self.template is not None:
-            description = build_caption(self.template, ap_date(frame.captured),
-                                        self.config) or None
-            extra = self._iptc_fields()
-        return {
+        # Per-frame fields (label, rights {year}, caption date) over the folder-constant
+        # IPTC set, which is built once and cached.
+        fields = {
             # Under --rewrite we never set a label: write_sidecar(merge) leaves any
             # existing Purple untouched, and we can't know lock status without the card.
             'label':       None if self.rewrite else ('Purple' if frame.locked else None),
             'rights':      rights,
             'creator':     self.config.get('creator') or None,
-            'description': description,
-            **extra,
+            'description': None,
         }
+        if self.template is not None:
+            fields['description'] = build_caption(self.template, ap_date(frame.captured),
+                                                  self.config) or None
+            fields.update(self._iptc_fields())
+        return fields
 
     def _iptc_fields(self):
         """Folder-constant IPTC structured fields from the template (with the config
-        credit/creator as the photoshop:Credit fallback, matching the caption byline)."""
-        def g(key):
-            v = self.template.get(key)
-            return (v.strip() if isinstance(v, str) else '') or None
-        credit = g('credit') or self.config.get('credit') or self.config.get('creator')
-        return {
-            'headline':     self._headline(),
-            'credit':       credit or None,
-            'source':       g('source'),
-            'city':         g('city'),
-            'state':        g('state'),
-            'country':      g('country'),
-            'location':     g('venue'),     # Iptc4xmpCore:Location = sublocation
-            'instructions': g('assignment'),
-            'usage_terms':  g('rightsUsage'),
-            'keywords':     self._keywords(),
-        }
+        credit/creator as the photoshop:Credit fallback, matching the caption byline).
+
+        Depends only on template + config, not the frame, so it is built once and cached.
+        """
+        if self._iptc is None:
+            def g(key):
+                v = self.template.get(key)
+                return (v.strip() if isinstance(v, str) else '') or None
+            credit = g('credit') or self.config.get('credit') or self.config.get('creator')
+            self._iptc = {
+                'headline':     self._headline(),
+                'credit':       credit or None,
+                'source':       g('source'),
+                'city':         g('city'),
+                'state':        g('state'),
+                'country':      g('country'),
+                'location':     g('venue'),     # Iptc4xmpCore:Location = sublocation
+                'instructions': g('assignment'),
+                'usage_terms':  g('rightsUsage'),
+                'keywords':     self._keywords(),
+            }
+        return self._iptc
 
     def _headline(self):
         """'{homeShort} vs {awayShort} {sport}', else the event, else None."""
@@ -1246,9 +1256,10 @@ def build_parser():
             '\n'
             'Frames locked (protected) in-camera are detected, copied unlocked, and\n'
             'tagged with a Purple color label for Lightroom via an .xmp sidecar.\n'
-            'Copyright/creator (from ~/.photohaul) and a per-folder caption template\n'
-            '(photohaul.json) are written to that sidecar too. The card is never\n'
-            'modified; the copied raw is a byte-exact clone unless a capture-time\n'
+            'Copyright/creator (from ~/.photohaul) and a per-folder template\n'
+            '(photohaul.json) - an AP-style caption plus structured IPTC fields - are\n'
+            'written to that sidecar too. The card is never modified; the copied raw\n'
+            'is a byte-exact clone unless a capture-time\n'
             'correction (time_shift / shot_tz in photohaul.json) is set, which rewrites\n'
             "the copy's EXIF date/offset fields in place at the same byte length."),
         epilog=(
@@ -1303,8 +1314,8 @@ def build_parser():
             '  - A same-named file of matching size is skipped; one of different size\n'
             '    is reported as a conflict and never overwritten.\n'
             '  - Sidecars are create-if-absent; --rewrite merges our fields into an\n'
-            '    existing sidecar (copyright, creator, caption) and preserves\n'
-            '    everything else, e.g. Lightroom develop edits.\n'
+            '    existing sidecar (copyright, creator, caption, IPTC fields) and\n'
+            '    preserves everything else, e.g. Lightroom develop edits.\n'
             '  - --rewrite works on the destination only - no card needed and nothing\n'
             '    copied. A Purple label already in a sidecar is kept; it is never added\n'
             '    or removed (lock status is unknown without the card).'))
@@ -1325,8 +1336,8 @@ def build_parser():
     ap.add_argument('--rewrite', action='store_true',
                     help='refresh sidecar metadata on already-copied files in the '
                          'destination; the card is not used and nothing is copied. '
-                         'Merges our fields (rights, creator, caption) into existing '
-                         'sidecars and preserves the rest, including any Purple label')
+                         'Merges our fields (rights, creator, caption, IPTC) into '
+                         'existing sidecars and preserves the rest, including any Purple label')
     ap.add_argument('--init-template', action='store_true',
                     help='write a blank %s into the destination and exit' % TEMPLATE_NAME)
     ap.add_argument('--profile',
