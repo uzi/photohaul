@@ -2,9 +2,10 @@
 #
 # photohaul - ingest photos from a mounted camera card.
 #
-# Copies *.ARW off the card into the current folder, renaming each to a stable
-# YYYYMMDD-hhmmss_mmm.ext name derived from Exif (millisecond timestamp = unique key,
-# so names are identical no matter which subset is copied -> safe partial/repeat runs).
+# Copies raw files off the card (default *.ARW; the extension arg also selects Nikon
+# NEF, Fuji RAF, Canon CR3, JPEG, ...) into the current folder, renaming each to a
+# stable YYYYMMDD-hhmmss_mmm.ext name derived from Exif (millisecond timestamp = unique
+# key, so names are identical no matter which subset is copied -> safe partial/repeat).
 # In-camera "locked" frames (the FAT read-only bit, surfaced on macOS as the uchg flag)
 # are detected, copied unlocked, and marked Purple for Lightroom via an .xmp sidecar.
 # Copyright/creator (from ~/.photohaul) and a per-folder caption template
@@ -29,7 +30,8 @@ from dataclasses import dataclass, field
 IS_TTY = sys.stdout.isatty()
 
 # ---------------------------------------------------------------------------
-# Exif reader (stdlib only) - just the two standard tags we need.
+# Exif reader (stdlib only) - pulls the capture timestamp (DateTimeOriginal +
+# SubSecTimeOriginal) from TIFF raws (ARW/NEF), Fuji RAF, and Canon CR3.
 # ---------------------------------------------------------------------------
 
 EXIF_IFD_PTR      = 0x8769
@@ -121,11 +123,11 @@ def _bmff_find(f, path, start, end):
 def read_exif_datetime(path):
     """Return (datetime_str, subsec_str_or_None) from a TIFF/JPEG raw, Fuji RAF, or Canon CR3.
 
-    Reads only the header and the two relevant IFDs via seeks - never the whole file.
+    Reads only the header and the relevant IFD(s) via seeks - never the whole file.
     Raises ValueError on anything it can't parse.
     """
     with open(path, 'rb') as f:
-        base = _exif_tiff_base(f)                       # 0 for TIFF/ARW; embedded for RAF
+        base = _exif_tiff_base(f)                       # 0 for TIFF (ARW/NEF); nonzero for RAF/CR3
         f.seek(base)
         head = f.read(8)
         if head[:2] == b'II':
