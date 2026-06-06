@@ -85,6 +85,8 @@ def _raf_exif_base(f):
         if len(marker) < 2 or marker[0] != 0xFF or marker == b'\xff\xd9':
             raise ValueError('RAF: no Exif in embedded JPEG')
         (seglen,) = struct.unpack('>H', f.read(2))
+        if seglen < 2:                                 # length includes its own 2 bytes;
+            raise ValueError('RAF: bad JPEG segment length')   # < 2 would seek backward
         seg_start = f.tell()
         if marker == b'\xff\xe1' and f.read(6) == b'Exif\x00\x00':
             return f.tell()                            # TIFF header begins here
@@ -817,7 +819,7 @@ def copy_file(src, dest, on_chunk=None, date_delta=timedelta(0), target_offset=N
     src_size = os.path.getsize(src)
     if total != src_size:
         os.remove(partial)
-        raise IOError('size mismatch after copy (%d != %d)' % (total, src_size))
+        raise OSError('size mismatch after copy (%d != %d)' % (total, src_size))
     if date_delta or target_offset is not None:
         try:
             shift_exif_in_place(partial, date_delta, target_offset)
@@ -1075,16 +1077,20 @@ class Haul:
     def copy(self):
         """Copy every to-copy frame, updating a live progress display."""
         progress = Progress(len(self.to_copy), self.copy_bytes)
-        for f in self.to_copy:
-            try:
-                copy_file(f.src, f.dest, on_chunk=progress.tick,
-                          date_delta=f.date_delta, target_offset=self.shot_tz)
-            except (OSError, IOError) as e:
-                self.errors.append('%s: copy failed (%s)'
-                                   % (os.path.basename(f.dest), e))
-                continue
-            progress.file_done()
-        progress.finish()
+        try:
+            for f in self.to_copy:
+                try:
+                    copy_file(f.src, f.dest, on_chunk=progress.tick,
+                              date_delta=f.date_delta, target_offset=self.shot_tz)
+                except OSError as e:
+                    self.errors.append('%s: copy failed (%s)'
+                                       % (os.path.basename(f.dest), e))
+                    continue
+                progress.file_done()
+        finally:
+            # Always terminate the progress line - even if an ExifPatchError aborts the
+            # run mid-copy - so the error message starts on its own line.
+            progress.finish()
         return progress
 
     def fields_for(self, frame):
