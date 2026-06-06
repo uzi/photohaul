@@ -10,8 +10,10 @@
 # In-camera "locked" frames (the FAT read-only bit, surfaced on macOS as the uchg flag)
 # are detected, copied unlocked, and marked Purple for Lightroom via an .xmp sidecar.
 # Copyright/creator (from ~/.photohaul) and a per-folder caption template
-# (photohaul.json) are written to the same sidecar. The raw is never modified, so its
-# size always matches the card original and re-runs stay idempotent.
+# (photohaul.json) are written to the same sidecar. The raw is copied byte-for-byte,
+# the lone exception being an optional capture-time/timezone correction (photohaul.json)
+# that overwrites the copy's EXIF date/offset fields in place at the same byte length -
+# so the copy's size always matches the card original and re-runs stay idempotent.
 #
 # Read-only on the source: the card is never modified.
 # Zero dependencies: stdlib only.
@@ -21,23 +23,33 @@ import calendar
 import configparser
 import json
 import os
+import re
 import stat
 import struct
 import sys
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 
 IS_TTY = sys.stdout.isatty()
 
 # ---------------------------------------------------------------------------
 # Exif reader (stdlib only) - pulls the capture timestamp (DateTimeOriginal +
-# SubSecTimeOriginal) from TIFF raws (ARW/NEF), Fuji RAF, and Canon CR3.
+# SubSecTimeOriginal) and recorded UTC offset (OffsetTimeOriginal) from TIFF raws
+# (ARW/NEF), Fuji RAF, and Canon CR3. The same header-only IFD walk also backs the
+# in-place date/offset patcher (shift_exif_in_place), which reuses read_ifd to find
+# each field's file offset and overwrites it at the identical byte length.
 # ---------------------------------------------------------------------------
 
-EXIF_IFD_PTR      = 0x8769
-DATETIME_ORIGINAL = 0x9003
-SUBSEC_ORIGINAL   = 0x9291
+EXIF_IFD_PTR        = 0x8769
+DATETIME            = 0x0132   # IFD0 modify date/time
+DATETIME_ORIGINAL   = 0x9003
+DATETIME_DIGITIZED  = 0x9004
+SUBSEC_ORIGINAL     = 0x9291
+OFFSET_TIME         = 0x9010   # UTC offset of DateTime
+OFFSET_TIME_ORIGINAL  = 0x9011 # UTC offset of DateTimeOriginal
+OFFSET_TIME_DIGITIZED = 0x9012 # UTC offset of DateTimeDigitized
 _TYPE_SIZES = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8}
 FUJI_MAGIC        = b'FUJIFILMCCD-RAW'
 RAF_JPEG_OFFSET   = 0x54   # RAF header field: file offset of the embedded JPEG (BE u32)
@@ -121,64 +133,258 @@ def _bmff_find(f, path, start, end):
     return None
 
 
-def read_exif_datetime(path):
-    """Return (datetime_str, subsec_str_or_None) from a TIFF/JPEG raw, Fuji RAF, or Canon CR3.
+def read_ifd(f, base, bo, off):
+    """Read one TIFF IFD at base+off; return {tag: (typ, cnt, valoff, valfield_pos)}.
 
+    `valoff` is the raw 4-byte value/offset field; `valfield_pos` is its absolute
+    file position - the seek target the in-place patcher overwrites for inline values.
+    """
+    f.seek(base + off)
+    (n,) = struct.unpack(bo + 'H', f.read(2))
+    raw = f.read(n * 12)
+    entries = {}
+    for i in range(n):
+        tag, typ, cnt = struct.unpack(bo + 'HHI', raw[i * 12:i * 12 + 8])
+        valoff = raw[i * 12 + 8:i * 12 + 12]
+        valfield_pos = base + off + 2 + i * 12 + 8
+        entries[tag] = (typ, cnt, valoff, valfield_pos)
+    return entries
+
+
+def _field_loc(f, base, bo, entry):
+    """Absolute (file_offset, byte_length) of an entry's value bytes.
+
+    Values <=4 bytes sit inline in the entry; larger ones are pointed to from base.
+    """
+    typ, cnt, valoff, valfield_pos = entry
+    size = _TYPE_SIZES.get(typ, 1) * cnt
+    if size <= 4:
+        return valfield_pos, size
+    (o,) = struct.unpack(bo + 'I', valoff)
+    return base + o, size
+
+
+def ascii_val(f, base, bo, entry):
+    pos, size = _field_loc(f, base, bo, entry)
+    f.seek(pos)
+    data = f.read(size)
+    return data.split(b'\x00')[0].decode('ascii', 'replace')
+
+
+def _exif_ifds(f):
+    """Parse the TIFF header and return (base, bo, ifd0_entries, exif_entries).
+
+    `exif_entries` is the Exif IFD when an EXIF_IFD_PTR is present (ARW/NEF/RAF), else
+    IFD0 itself (CR3 CMT2 carries the date tags directly). Raises ValueError if the
+    header is not a TIFF/Exif block or no Exif IFD is found.
+    """
+    base = _exif_tiff_base(f)                       # 0 for TIFF (ARW/NEF); nonzero for RAF/CR3
+    f.seek(base)
+    head = f.read(8)
+    if head[:2] == b'II':
+        bo = '<'
+    elif head[:2] == b'MM':
+        bo = '>'
+    else:
+        raise ValueError('not a TIFF/Exif file')
+    (magic,) = struct.unpack(bo + 'H', head[2:4])
+    if magic != 42:
+        raise ValueError('bad TIFF magic')
+    (ifd0,) = struct.unpack(bo + 'I', head[4:8])
+    e0 = read_ifd(f, base, bo, ifd0)
+    if EXIF_IFD_PTR in e0:
+        # ARW/NEF/RAF: the canonical DateTimeOriginal + SubSec live in the Exif IFD
+        # (some bodies also copy the date into IFD0 - prefer the Exif IFD, which is
+        # the one that also carries SubSecTimeOriginal).
+        (exif_off,) = struct.unpack(bo + 'I', e0[EXIF_IFD_PTR][2])
+        ee = read_ifd(f, base, bo, exif_off)
+    elif DATETIME_ORIGINAL in e0:
+        ee = e0                            # CR3 CMT2: no Exif pointer; tags in this IFD
+    else:
+        raise ValueError('no Exif IFD')
+    return base, bo, e0, ee
+
+
+def read_exif_datetime(path):
+    """Return (datetime_str, subsec_str_or_None, offset_str_or_None) from a TIFF/JPEG
+    raw, Fuji RAF, or Canon CR3.
+
+    The offset is OffsetTimeOriginal (0x9011), the zone shot_tz derives its shift from.
     Reads only the header and the relevant IFD(s) via seeks - never the whole file.
     Raises ValueError on anything it can't parse.
     """
     with open(path, 'rb') as f:
-        base = _exif_tiff_base(f)                       # 0 for TIFF (ARW/NEF); nonzero for RAF/CR3
-        f.seek(base)
-        head = f.read(8)
-        if head[:2] == b'II':
-            bo = '<'
-        elif head[:2] == b'MM':
-            bo = '>'
-        else:
-            raise ValueError('not a TIFF/Exif file')
-        (magic,) = struct.unpack(bo + 'H', head[2:4])
-        if magic != 42:
-            raise ValueError('bad TIFF magic')
-        (ifd0,) = struct.unpack(bo + 'I', head[4:8])
-
-        def read_ifd(off):
-            f.seek(base + off)
-            (n,) = struct.unpack(bo + 'H', f.read(2))
-            raw = f.read(n * 12)
-            entries = {}
-            for i in range(n):
-                tag, typ, cnt = struct.unpack(bo + 'HHI', raw[i * 12:i * 12 + 8])
-                entries[tag] = (typ, cnt, raw[i * 12 + 8:i * 12 + 12])
-            return entries
-
-        def ascii_val(entry):
-            typ, cnt, valoff = entry
-            size = _TYPE_SIZES.get(typ, 1) * cnt
-            if size <= 4:
-                data = valoff[:size]
-            else:
-                (o,) = struct.unpack(bo + 'I', valoff)
-                f.seek(base + o)
-                data = f.read(size)
-            return data.split(b'\x00')[0].decode('ascii', 'replace')
-
-        e0 = read_ifd(ifd0)
-        if EXIF_IFD_PTR in e0:
-            # ARW/NEF/RAF: the canonical DateTimeOriginal + SubSec live in the Exif
-            # IFD (some bodies also copy the date into IFD0 - prefer the Exif IFD,
-            # which is the one that also carries SubSecTimeOriginal).
-            (exif_off,) = struct.unpack(bo + 'I', e0[EXIF_IFD_PTR][2])
-            ee = read_ifd(exif_off)
-        elif DATETIME_ORIGINAL in e0:
-            ee = e0                            # CR3 CMT2: no Exif pointer; tags in this IFD
-        else:
-            raise ValueError('no Exif IFD')
+        base, bo, _e0, ee = _exif_ifds(f)
         if DATETIME_ORIGINAL not in ee:
             raise ValueError('no DateTimeOriginal')
-        dt = ascii_val(ee[DATETIME_ORIGINAL])
-        sub = ascii_val(ee[SUBSEC_ORIGINAL]) if SUBSEC_ORIGINAL in ee else None
-        return dt, sub
+        dt = ascii_val(f, base, bo, ee[DATETIME_ORIGINAL])
+        sub = ascii_val(f, base, bo, ee[SUBSEC_ORIGINAL]) if SUBSEC_ORIGINAL in ee else None
+        rec_off = (ascii_val(f, base, bo, ee[OFFSET_TIME_ORIGINAL])
+                   if OFFSET_TIME_ORIGINAL in ee else None)
+        return dt, sub, rec_off
+
+
+# ---------------------------------------------------------------------------
+# Capture-time correction (clock drift + timezone)
+#
+# Two orthogonal, composable folder-level knobs from photohaul.json:
+#   time_shift - a wall-clock-only nudge of the date fields (the old clock was wrong).
+#   shot_tz    - "these were actually shot at this UTC offset"; derives an instant-
+#                preserving shift from the recorded offset and restamps the offset tags.
+# Both drive one corrected timestamp (filename, caption, {year}) and an in-place
+# overwrite of the copied raw's EXIF date/offset bytes - same byte length, no IFD
+# restructuring. See docs/20260605_capture_time_offset_plan.md.
+# ---------------------------------------------------------------------------
+
+_DATE_FMT = '%Y:%m:%d %H:%M:%S'   # EXIF date, 19 chars + NUL = 20-byte fixed width
+_TZ_LEN   = 6                     # '±HH:MM', stored as 6 chars + NUL = 7-byte width
+
+
+class ExifPatchError(Exception):
+    """A capture-time correction could not be applied. Aborts the run (unlike the
+    per-file OSError handler in copy()), so no half-patched file is left behind."""
+
+
+def parse_time_shift(s):
+    """Parse a signed wall-clock shift like '+2h30m', '-15s', '90m' -> timedelta.
+
+    Units d/h/m/s, combinable, whole seconds only (so SubSecTimeOriginal and the
+    filename's millisecond key are never disturbed). Raises ValueError on bad input.
+    """
+    m = re.fullmatch(r'([+-]?)((?:\d+[dhms])+)', s.strip())
+    if not m:
+        raise ValueError("bad time_shift %r (want e.g. +2h30m, -15s, 90m)" % s)
+    units = {'d': 86400, 'h': 3600, 'm': 60, 's': 1}
+    secs = sum(int(n) * units[u] for n, u in re.findall(r'(\d+)([dhms])', m.group(2)))
+    return timedelta(seconds=(-secs if m.group(1) == '-' else secs))
+
+
+def parse_tz(s):
+    """Parse a strict '±HH:MM' UTC offset (e.g. '-04:00', '+05:30') -> timedelta.
+
+    Raises ValueError on bad input.
+    """
+    m = re.fullmatch(r'([+-])(\d{2}):(\d{2})', s.strip())
+    if not m:
+        raise ValueError("bad UTC offset %r (want ±HH:MM, e.g. -04:00)" % s)
+    hh, mm = int(m.group(2)), int(m.group(3))
+    if hh > 14 or mm > 59:
+        raise ValueError("UTC offset out of range %r" % s)
+    secs = hh * 3600 + mm * 60
+    return timedelta(seconds=(-secs if m.group(1) == '-' else secs))
+
+
+def format_tz(delta):
+    """timedelta -> normalized '±HH:MM' (the canonical bytes written to offset tags)."""
+    total = int(delta.total_seconds())
+    sign = '-' if total < 0 else '+'
+    total = abs(total)
+    return '%s%02d:%02d' % (sign, total // 3600, (total % 3600) // 60)
+
+
+def format_shift(delta):
+    """timedelta -> compact signed '+2h30m' / '-15s' / '+0s' for reporting."""
+    total = int(delta.total_seconds())
+    sign = '-' if total < 0 else '+'
+    total = abs(total)
+    out = ''
+    for unit, sec in (('d', 86400), ('h', 3600), ('m', 60), ('s', 1)):
+        if total >= sec:
+            out += '%d%s' % (total // sec, unit)
+            total %= sec
+    return sign + (out or '0s')
+
+
+def shift_exif_datetime(dt_str, delta):
+    """'2026:05:30 12:12:56' + delta -> shifted string of identical 19-char width.
+
+    Handles minute/hour/day/month/year rollover via datetime. Raises ValueError if
+    the stored value isn't a parseable EXIF datetime.
+    """
+    try:
+        dt = datetime.strptime(dt_str.strip(), _DATE_FMT)
+    except ValueError:
+        raise ValueError('unparseable EXIF datetime %r' % dt_str)
+    return (dt + delta).strftime(_DATE_FMT)
+
+
+def _patch_date_field(f, base, bo, entries, tag, delta):
+    """Shift one present ASCII date field in place by delta; return True if patched.
+
+    Same-length 19-byte overwrite (the trailing NUL of the 20-byte field is kept).
+    Raises ExifPatchError on unexpected type/width or an unparseable stored value.
+    """
+    if tag not in entries:
+        return False
+    typ, cnt = entries[tag][0], entries[tag][1]
+    pos, size = _field_loc(f, base, bo, entries[tag])
+    if typ != 2 or cnt != 20:
+        raise ExifPatchError('tag 0x%04x: unexpected date type/width (%d/%d)'
+                             % (tag, typ, cnt))
+    f.seek(pos)
+    old = f.read(size).split(b'\x00')[0].decode('ascii', 'replace')
+    try:
+        new = shift_exif_datetime(old, delta).encode('ascii')
+    except ValueError as e:
+        raise ExifPatchError('tag 0x%04x: %s' % (tag, e))
+    if len(new) != 19:
+        raise ExifPatchError('tag 0x%04x: reformatted date is not 19 bytes' % tag)
+    f.seek(pos)
+    f.write(new)
+    return True
+
+
+def _patch_offset_field(f, base, bo, entries, tag, target):
+    """Overwrite one present ASCII offset tag in place with `target` ('±HH:MM').
+
+    Same-length 6-byte overwrite (the NUL of the 7-byte field is kept). Returns True
+    if patched; raises ExifPatchError on unexpected type/width.
+    """
+    if tag not in entries:
+        return False
+    typ, cnt = entries[tag][0], entries[tag][1]
+    pos, _size = _field_loc(f, base, bo, entries[tag])
+    if typ != 2 or cnt != 7:
+        raise ExifPatchError('tag 0x%04x: unexpected offset type/width (%d/%d)'
+                             % (tag, typ, cnt))
+    new = target.encode('ascii')
+    if len(new) != _TZ_LEN:
+        raise ExifPatchError('tag 0x%04x: offset target is not %d bytes' % (tag, _TZ_LEN))
+    f.seek(pos)
+    f.write(new)
+    return True
+
+
+def shift_exif_in_place(path, date_delta, target_offset):
+    """Correct the copied raw's EXIF in place: shift each present date field by
+    date_delta, and (when target_offset is given) restamp each present offset tag.
+
+    Same-length ASCII overwrites only - no IFD restructuring, no MakerNote pointer
+    touched, so the file size is unchanged. Returns the list of patched field names.
+    Raises ExifPatchError on any anomaly; the caller removes the .partial.
+    """
+    patched = []
+    with open(path, 'r+b') as f:
+        try:
+            base, bo, e0, ee = _exif_ifds(f)
+        except ValueError as e:
+            raise ExifPatchError(str(e))
+        # Date fields - shift each individually (preserves any rare per-field diff).
+        for entries, tag, name in ((e0, DATETIME, 'DateTime'),
+                                   (ee, DATETIME_ORIGINAL, 'DateTimeOriginal'),
+                                   (ee, DATETIME_DIGITIZED, 'DateTimeDigitized')):
+            if _patch_date_field(f, base, bo, entries, tag, date_delta):
+                patched.append(name)
+        # Offset tags - only when shot_tz gave a target.
+        if target_offset is not None:
+            for tag, name in ((OFFSET_TIME_ORIGINAL, 'OffsetTimeOriginal'),
+                              (OFFSET_TIME, 'OffsetTime'),
+                              (OFFSET_TIME_DIGITIZED, 'OffsetTimeDigitized')):
+                if _patch_offset_field(f, base, bo, ee, tag, target_offset):
+                    patched.append(name)
+        f.flush()
+        os.fsync(f.fileno())
+    return patched
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +517,7 @@ def write_template(dest_dir):
     path = os.path.join(dest_dir, TEMPLATE_NAME)
     if os.path.exists(path):
         sys.exit("Error: %s already exists; not overwriting." % path)
-    keys = ['profile'] + TEMPLATE_KEYS
+    keys = ['profile'] + TEMPLATE_KEYS + ['time_shift', 'shot_tz']
     lines = ['{']
     for i, key in enumerate(keys):
         tail = ',' if i < len(keys) - 1 else ''
@@ -524,10 +730,15 @@ def write_sidecar(sidecar, fields, merge):
 CHUNK = 8 * 1024 * 1024
 
 
-def copy_file(src, dest, on_chunk=None):
-    """Crash-safe copy: write to .partial, fsync, atomic rename, then unlock.
+def copy_file(src, dest, on_chunk=None, date_delta=timedelta(0), target_offset=None):
+    """Crash-safe copy: write to .partial, fsync, size-check, optionally correct the
+    EXIF in place, atomic rename, then unlock.
 
-    Calls on_chunk(nbytes) for progress. Returns bytes copied.
+    Calls on_chunk(nbytes) for progress. Returns bytes copied. The EXIF patch is a
+    same-length overwrite, so the size check still holds and dest size still equals
+    the card original. Patching the .partial *before* the rename keeps the invariant
+    that a file at its final path is always fully corrected; an ExifPatchError removes
+    the .partial and propagates (aborting the run) rather than stranding a bad file.
     """
     partial = dest + '.partial'
     total = 0
@@ -546,6 +757,12 @@ def copy_file(src, dest, on_chunk=None):
     if total != src_size:
         os.remove(partial)
         raise IOError('size mismatch after copy (%d != %d)' % (total, src_size))
+    if date_delta or target_offset is not None:
+        try:
+            shift_exif_in_place(partial, date_delta, target_offset)
+        except ExifPatchError:
+            os.remove(partial)
+            raise
     os.rename(partial, dest)
     # Belt-and-suspenders: ensure the copy is unlocked and writable.
     try:
@@ -630,7 +847,8 @@ class Frame:
     size: int
     locked: bool
     dest: str
-    captured: str          # Exif datetime, e.g. '2026:05:26 14:00:24'
+    captured: str          # corrected Exif datetime, e.g. '2026:05:26 14:00:24'
+    date_delta: timedelta = timedelta(0)   # wall-clock shift to patch into the copy
 
     @property
     def sidecar(self):
@@ -649,6 +867,9 @@ class Haul:
     config: dict
     template: dict          # None if no photohaul.json present
     profile: str            # active profile name (DEFAULT_PROFILE if none)
+    time_shift: timedelta = timedelta(0)   # drift nudge (forced 0 under --rewrite)
+    shot_tz: str = None     # normalized '±HH:MM' target, or None if no tz correction
+    shot_tz_delta: timedelta = None         # parsed shot_tz, for deriving zone_delta
 
     frames: list = field(default_factory=list)      # frames passing the filter
     featured: int = 0                               # locked frames seen (pre-filter)
@@ -678,19 +899,41 @@ class Haul:
             if self.filt == 'unlocked' and locked:
                 continue
             try:
-                dt, sub = read_exif_datetime(src)
-                base = base_name(dt, sub)
+                dt, sub, rec_off = read_exif_datetime(src)
             except (ValueError, OSError) as e:
                 self.errors.append('%s: cannot read Exif (%s)'
                                    % (os.path.basename(src), e))
                 continue
+            # Correct the wall-clock time before naming so the dest name, caption,
+            # and {year} all derive from the corrected instant. A shot_tz with no
+            # recorded offset to derive from is a hard error (aborts the run).
+            date_delta = self._date_delta(src, rec_off)
+            dt = shift_exif_datetime(dt, date_delta)
+            base = base_name(dt, sub)
             if base in used_names:
                 used_names[base] += 1
                 base = '%s-%s' % (base, dsc_number(src))
             else:
                 used_names[base] = 1
             dest = os.path.join(self.dest_dir, base + '.' + self.ext)
-            self.frames.append(Frame(src, os.path.getsize(src), locked, dest, dt))
+            self.frames.append(Frame(src, os.path.getsize(src), locked, dest, dt,
+                                     date_delta=date_delta))
+
+    def _date_delta(self, src, rec_off):
+        """Total wall-clock shift for a frame: zone_delta (from shot_tz) + time_shift.
+
+        zone_delta = shot_tz target - the frame's recorded OffsetTimeOriginal, so a
+        shot_tz correction is instant-preserving. shot_tz with no recorded offset to
+        derive from raises ExifPatchError.
+        """
+        zone_delta = timedelta(0)
+        if self.shot_tz is not None:
+            if rec_off is None:
+                raise ExifPatchError(
+                    '%s: shot_tz set but no recorded OffsetTimeOriginal to derive from'
+                    % os.path.basename(src))
+            zone_delta = self.shot_tz_delta - parse_tz(rec_off)
+        return zone_delta + self.time_shift
 
     def scan_dest(self):
         """Card-free scan for --rewrite: find already-copied files in the destination
@@ -703,7 +946,7 @@ class Haul:
         for name in names:
             dest = os.path.join(self.dest_dir, name)
             try:
-                dt, _sub = read_exif_datetime(dest)
+                dt, _sub, _off = read_exif_datetime(dest)
             except (ValueError, OSError) as e:
                 self.errors.append('%s: cannot read Exif (%s)' % (name, e))
                 continue
@@ -741,6 +984,13 @@ class Haul:
                      (', %d CONFLICT' % len(self.conflicts)) if self.conflicts else ''))
         if self.profile != DEFAULT_PROFILE:
             print('Profile: %s' % self.profile)
+        tparts = []
+        if self.shot_tz is not None:
+            tparts.append('tz %s' % self.shot_tz)
+        if self.time_shift:
+            tparts.append('shift %s' % format_shift(self.time_shift))
+        if tparts:
+            print('Time: %s (corrects copied EXIF in place)' % ', '.join(tparts))
         meta = []
         if self.config.get('copyright') or self.config.get('creator'):
             meta.append('rights')
@@ -764,7 +1014,8 @@ class Haul:
         progress = Progress(len(self.to_copy), self.copy_bytes)
         for f in self.to_copy:
             try:
-                copy_file(f.src, f.dest, on_chunk=progress.tick)
+                copy_file(f.src, f.dest, on_chunk=progress.tick,
+                          date_delta=f.date_delta, target_offset=self.shot_tz)
             except (OSError, IOError) as e:
                 self.errors.append('%s: copy failed (%s)'
                                    % (os.path.basename(f.dest), e))
@@ -890,7 +1141,9 @@ def build_parser():
             'tagged with a Purple color label for Lightroom via an .xmp sidecar.\n'
             'Copyright/creator (from ~/.photohaul) and a per-folder caption template\n'
             '(photohaul.json) are written to that sidecar too. The card is never\n'
-            'modified, and the raw stays a byte-exact clone of the card original.'),
+            'modified; the copied raw is a byte-exact clone unless a capture-time\n'
+            'correction (time_shift / shot_tz in photohaul.json) is set, which rewrites\n'
+            "the copy's EXIF date/offset fields in place at the same byte length."),
         epilog=(
             'examples:\n'
             '  photohaul                    # use format= from ~/.photohaul\n'
@@ -919,6 +1172,17 @@ def build_parser():
             '  omitted from the caption).\n'
             '  --> "Team A vs Team B, Event, at Venue, City, ST on May 30, 2026.\n'
             '       Photo by Your Name/site.com."\n'
+            '\n'
+            'capture-time correction (photohaul.json, optional; corrects the copy only):\n'
+            '  time_shift: "+2h30m"   drift fix - nudge the wall-clock time (units\n'
+            '                         d/h/m/s, signed, whole seconds; offset tags kept).\n'
+            '  shot_tz:    "-04:00"   travel fix - "shot at this UTC offset"; shifts the\n'
+            '                         time to stay the same instant AND restamps the\n'
+            '                         offset tags. shot_tz alone is the full travel fix.\n'
+            '  Both compose. They drive the dest name, caption date, and an in-place\n'
+            '  rewrite of the copied raw\'s EXIF date/offset bytes (same size). SET THEM\n'
+            '  BEFORE the first ingest of a folder - changing them after files exist\n'
+            '  makes new names (duplicates), not updates. --rewrite ignores both.\n'
             '\n'
             'notes:\n'
             '  - Exif is read natively: TIFF raws (ARW, NEF) and JPEG directly, Fuji\n'
@@ -977,6 +1241,24 @@ def main():
     profile = args.profile or (template or {}).get('profile') or DEFAULT_PROFILE
     config = load_config(profile)
 
+    # Capture-time corrections live only in photohaul.json (no CLI flag, so a forgotten
+    # flag can't silently rename everything). Validated once here, before any copy.
+    # --rewrite reads the already-corrected destination files, so it forces both off to
+    # avoid double-shifting (it still uses the JSON for caption content).
+    time_shift = timedelta(0)
+    shot_tz = shot_tz_delta = None
+    if not args.rewrite and template:
+        ts = (template.get('time_shift') or '').strip()
+        tz = (template.get('shot_tz') or '').strip()
+        try:
+            if ts:
+                time_shift = parse_time_shift(ts)
+            if tz:
+                shot_tz_delta = parse_tz(tz)
+                shot_tz = format_tz(shot_tz_delta)
+        except ValueError as e:
+            sys.exit('Error: %s in %s' % (e, os.path.join(dest_dir, TEMPLATE_NAME)))
+
     # Format: the positional overrides the config; there is no built-in default.
     ext = (args.extension or config.get('format') or '').lstrip('.').lower()
     if not ext:
@@ -995,10 +1277,14 @@ def main():
         if not scan_source(card, ext):
             sys.exit("Error: no .%s files found under %s/DCIM" % (ext, card))
 
-    return Haul(card=card, ext=ext, dest_dir=dest_dir, filt=args.filter,
-                dry_run=args.dry_run, rewrite=args.rewrite,
-                config=config, template=template,
-                profile=profile).run()
+    try:
+        return Haul(card=card, ext=ext, dest_dir=dest_dir, filt=args.filter,
+                    dry_run=args.dry_run, rewrite=args.rewrite,
+                    config=config, template=template, profile=profile,
+                    time_shift=time_shift, shot_tz=shot_tz,
+                    shot_tz_delta=shot_tz_delta).run()
+    except ExifPatchError as e:
+        sys.exit('Error: capture-time correction failed: %s' % e)
 
 
 if __name__ == '__main__':

@@ -37,8 +37,8 @@ The script is run from a destination folder; it's copied to `~/bin` by hand.
   / copyright / credit); `{year}` in copyright expands to the capture year. See
   `docs/20260605_profiles_plan.md`.
 - `photohaul.json` in the destination — per-folder caption template (teamA,
-  teamB, event, venue, location, credit) plus `profile`, and (planned)
-  `time_shift`. Scaffolded by `--init-template`.
+  teamB, event, venue, location, credit) plus `profile`, and the capture-time
+  correction keys `time_shift` / `shot_tz`. Scaffolded by `--init-template`.
 
 ## `--rewrite` is card-free
 `--rewrite` is a destination-only metadata refresh: no card, no copying. It scans

@@ -1,6 +1,6 @@
 # Plan: capture-time correction (clock drift + timezone)
 
-Status: planned (2026-06-05)
+Status: implemented (2026-06-05)
 
 Builds on the timestamp-driven naming in [[20260604_initial_plan]] and the
 per-folder template in [[20260605_caption_and_template_plan]]. Relaxes, in one

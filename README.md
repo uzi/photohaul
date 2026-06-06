@@ -39,7 +39,9 @@ See `src/photohaul.py --help` for the full list of options and examples.
 
 photohaul writes all metadata to the `.xmp` sidecar — never the raw — so the
 copied file stays a byte-exact clone of the card original and re-runs stay
-idempotent. Lightroom reads these on import.
+idempotent. (The lone exception is an opt-in capture-time correction, below, which
+rewrites the copy's EXIF date/offset fields in place.) Lightroom reads these on
+import.
 
 **Rights** come from an optional `~/.photohaul` config file (INI). Keys in
 `[default]` are inherited by every profile; a profile section overrides or adds.
@@ -73,18 +75,58 @@ auto-detected on ingest. Scaffold a blank one with `photohaul --init-template`:
   "event": "",
   "venue": "",
   "location": "",
-  "credit": ""
+  "credit": "",
+  "time_shift": "",
+  "shot_tz": ""
 }
 ```
 
-Blank fields are omitted from the caption (`profile` selects the rights preset
-and is not part of the caption text). A fully filled template yields, in
+Blank caption fields are omitted (`profile` selects the rights preset, and
+`time_shift` / `shot_tz` are the capture-time correction below — none are part of
+the caption text). A fully filled template yields, in
 `dc:description`:
 
 > Team A vs Team B, Event, at Venue, City, ST on May 30, 2026. Photo by Your Name/yoursite.com.
 
 (`date` is auto-filled per frame; `credit` falls back to the config `credit`,
 then `creator`.)
+
+## Capture-time correction (clock drift & timezone)
+
+Two optional, composable keys in `photohaul.json` fix a wrong capture time. Both
+drive the destination filename, the caption date, and `{year}`, **and** rewrite
+the copied raw's EXIF date/offset fields in place (a same-length overwrite — no
+structural change, size unchanged). The **card is never touched**; only the copy
+is corrected.
+
+```json
+{
+  "time_shift": "+2h30m",
+  "shot_tz": "-04:00"
+}
+```
+
+- **`time_shift`** — *clock drift.* A wall-clock-only nudge of the date fields
+  (the camera clock was simply wrong). Signed, units `d`/`h`/`m`/`s`, combinable
+  (`+2h30m`, `-15s`, `90m`); whole seconds only (the millisecond key is never
+  disturbed). The UTC-offset tags are left alone.
+- **`shot_tz`** — *timezone / travel* (the main use case). "These frames were
+  actually shot at this UTC offset." It derives the shift from the camera's
+  recorded offset, so it both moves the displayed time **and** restamps the three
+  offset tags — the absolute instant is preserved. Strict `±HH:MM`. **`shot_tz`
+  alone is the complete travel fix** — you don't also set `time_shift`. Worked
+  example: home `-07:00`, you fly three zones east and forget to change the
+  camera, shoot 3:00 pm local → the camera stamps `12:00 / -07:00`; `shot_tz:
+  "-04:00"` yields `15:00 / -04:00`, same instant.
+
+When both are set they compose (date fields shift by the sum; offsets set to
+`shot_tz`). Both are validated once at startup — bad input aborts before any copy.
+
+> **Set these before the first ingest of a folder.** The corrections feed the
+> filename, so changing them after files exist produces *new names* (duplicates),
+> not updates — re-ingest the folder cleanly instead. There is deliberately no CLI
+> flag (a forgotten flag could silently rename everything). `--rewrite` ignores
+> both keys, since the destination files already carry the corrected time.
 
 Sidecars are **create-if-absent** by default. `photohaul --rewrite` refreshes
 them on files **already in the destination** — no card is needed and nothing is
