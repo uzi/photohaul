@@ -38,17 +38,27 @@ SUBSEC_ORIGINAL   = 0x9291
 _TYPE_SIZES = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8}
 FUJI_MAGIC        = b'FUJIFILMCCD-RAW'
 RAF_JPEG_OFFSET   = 0x54   # RAF header field: file offset of the embedded JPEG (BE u32)
+CR3_BRAND         = b'crx '   # ftyp major brand identifying a Canon CR3 (ISO-BMFF)
 
 
 def _exif_tiff_base(f):
     """File offset of the Exif TIFF header.
 
-    0 for a TIFF-at-start file (ARW, JPEG-less TIFF). A Fuji RAF is not a TIFF;
-    its Exif lives in an embedded JPEG, so follow the header's JpgImageOffset and
-    walk the JPEG's APP1/Exif segment to the TIFF header inside it.
+    0 for a TIFF-at-start file (ARW/NEF, JPEG-less TIFF). Container formats keep
+    their Exif elsewhere:
+      - Fuji RAF: an embedded JPEG (follow JpgImageOffset to its APP1/Exif).
+      - Canon CR3: an ISO-BMFF box tree (moov/uuid/CMT2 is a standalone TIFF).
     """
-    if f.read(len(FUJI_MAGIC)) != FUJI_MAGIC:
-        return 0
+    head = f.read(16)
+    if head[:len(FUJI_MAGIC)] == FUJI_MAGIC:
+        return _raf_exif_base(f)
+    if head[4:8] == b'ftyp' and head[8:12] == CR3_BRAND:
+        return _cr3_exif_base(f)
+    return 0
+
+
+def _raf_exif_base(f):
+    """Fuji RAF: walk the header's embedded JPEG to the TIFF header in its APP1/Exif."""
     f.seek(RAF_JPEG_OFFSET)
     (jpg_off,) = struct.unpack('>I', f.read(4))
     f.seek(jpg_off)
@@ -65,8 +75,51 @@ def _exif_tiff_base(f):
         f.seek(seg_start + seglen - 2)                 # skip to next marker (incl. XMP APP1)
 
 
+def _cr3_exif_base(f):
+    """Canon CR3: the Exif is a standalone TIFF in the moov/uuid/CMT2 box."""
+    f.seek(0, os.SEEK_END)
+    box = _bmff_find(f, [b'moov', b'uuid', b'CMT2'], 0, f.tell())
+    if not box:
+        raise ValueError('CR3: no CMT2 Exif box')
+    return box[0]
+
+
+def _bmff_find(f, path, start, end):
+    """Locate a nested ISO-BMFF box by type path; return (payload_start, payload_end).
+
+    Reads only box headers via seeks (never the mdat payload). A 'uuid' box is
+    descended past its 16-byte id. Returns None if any path element is missing.
+    """
+    want = path[0]
+    p = start
+    while p + 8 <= end:
+        f.seek(p)
+        hdr = f.read(8)
+        if len(hdr) < 8:
+            break
+        (size,) = struct.unpack('>I', hdr[:4])
+        typ = hdr[4:8]
+        body = p + 8
+        if size == 1:                                  # 64-bit largesize follows
+            (size,) = struct.unpack('>Q', f.read(8))
+            body = p + 16
+        elif size == 0:                                # box runs to end of parent
+            size = end - p
+        if size < 8 or p + size > end:
+            break
+        if typ == want:
+            child = body + 16 if typ == b'uuid' else body
+            if len(path) == 1:
+                return (child, p + size)
+            found = _bmff_find(f, path[1:], child, p + size)
+            if found:
+                return found
+        p += size
+    return None
+
+
 def read_exif_datetime(path):
-    """Return (datetime_str, subsec_str_or_None) from a TIFF-structured raw/jpeg or RAF.
+    """Return (datetime_str, subsec_str_or_None) from a TIFF/JPEG raw, Fuji RAF, or Canon CR3.
 
     Reads only the header and the two relevant IFDs via seeks - never the whole file.
     Raises ValueError on anything it can't parse.
@@ -108,10 +161,16 @@ def read_exif_datetime(path):
             return data.split(b'\x00')[0].decode('ascii', 'replace')
 
         e0 = read_ifd(ifd0)
-        if EXIF_IFD_PTR not in e0:
+        if EXIF_IFD_PTR in e0:
+            # ARW/NEF/RAF: the canonical DateTimeOriginal + SubSec live in the Exif
+            # IFD (some bodies also copy the date into IFD0 - prefer the Exif IFD,
+            # which is the one that also carries SubSecTimeOriginal).
+            (exif_off,) = struct.unpack(bo + 'I', e0[EXIF_IFD_PTR][2])
+            ee = read_ifd(exif_off)
+        elif DATETIME_ORIGINAL in e0:
+            ee = e0                            # CR3 CMT2: no Exif pointer; tags in this IFD
+        else:
             raise ValueError('no Exif IFD')
-        (exif_off,) = struct.unpack(bo + 'I', e0[EXIF_IFD_PTR][2])
-        ee = read_ifd(exif_off)
         if DATETIME_ORIGINAL not in ee:
             raise ValueError('no DateTimeOriginal')
         dt = ascii_val(ee[DATETIME_ORIGINAL])
@@ -835,7 +894,7 @@ def build_parser():
             '  photohaul --dry-run          # show what would happen, touch nothing\n'
             '  photohaul --locked           # only the featured (locked) frames\n'
             '  photohaul jpg                # ingest .JPG instead of .ARW\n'
-            '  photohaul raf                # ingest Fuji .RAF (Exif read from its JPEG)\n'
+            '  photohaul raf                # Fuji .RAF (also: nef Nikon, cr3 Canon)\n'
             '  photohaul --init-template    # scaffold a blank photohaul.json here\n'
             '  photohaul --rewrite          # refresh copyright/caption sidecars (no card)\n'
             '  photohaul --profile personal # apply a named rights preset\n'
@@ -859,8 +918,9 @@ def build_parser():
             '       Photo by Your Name/site.com."\n'
             '\n'
             'notes:\n'
-            '  - Formats: any Exif-bearing TIFF raw (Sony ARW) or JPEG, plus Fuji RAF\n'
-            '    (Exif is read from its embedded JPEG). The extension picks the format.\n'
+            '  - Formats: TIFF-based raws (Sony ARW, Nikon NEF) and JPEG, plus Fuji RAF\n'
+            '    (Exif in an embedded JPEG) and Canon CR3 (Exif in its MP4-style moov\n'
+            '    box). The extension picks the format.\n'
             '  - The card is read-only here; it is never written to or modified.\n'
             '  - A same-named file of matching size is skipped; one of different size\n'
             '    is reported as a conflict and never overwritten.\n'
@@ -871,7 +931,7 @@ def build_parser():
             '    copied. A Purple label already in a sidecar is kept; it is never added\n'
             '    or removed (lock status is unknown without the card).'))
     ap.add_argument('extension', nargs='?', default='arw',
-                    help='file extension to ingest (default: arw; e.g. raf for Fuji, jpg)')
+                    help='file extension to ingest (default: arw; also raf, nef, cr3, jpg)')
     ap.add_argument('--source', help='card root (default: auto-detect under /Volumes)')
     ap.add_argument('--dest', default='.', help='destination dir (default: cwd)')
     sel = ap.add_mutually_exclusive_group()

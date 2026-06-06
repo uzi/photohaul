@@ -8,10 +8,17 @@ stable, millisecond-precise name derived from its Exif capture time
 comes only from the frame's own metadata, re-running on the same card just skips
 what already landed.
 
-Pick the format with the `extension` argument (default `arw`). Sony ARW is a
-TIFF at byte zero; Fuji **RAF** wraps its Exif in an embedded JPEG, which
-photohaul reads transparently — so `photohaul raf` ingests an X100VI/Fuji card
-the same way, Purple-labelling protected frames and all.
+Pick the format with the `extension` argument (default `arw`). photohaul reads
+Exif natively (no exiftool) from each of:
+
+- **ARW** (Sony) and **NEF** (Nikon) — TIFF at byte zero.
+- **RAF** (Fuji) — Exif lives in an embedded JPEG, read transparently.
+- **CR3** (Canon) — an MP4-style container; the Exif is pulled from its `moov`
+  metadata box.
+
+So `photohaul raf`, `photohaul nef`, or `photohaul cr3` ingests that card the
+same way as ARW — stable naming, byte-exact copies, and (where the camera's
+in-camera Protect maps to the macOS lock bit) Purple-labelling protected frames.
 
 Frames locked (protected) in-camera are detected, copied unlocked, and tagged
 with a Purple color label for Lightroom via an `.xmp` sidecar. **The card is
