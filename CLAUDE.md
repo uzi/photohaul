@@ -52,6 +52,11 @@ card). It errors if combined with `--locked`/`--unlocked`.
   status when it lands.
 - When adding or changing a flag, update **all three**: `--help` (the argparse
   epilog), `README.md`, and the relevant plan doc.
+- **Keep comments and docstrings current with the code.** When you change
+  behavior, re-read the surrounding comments, docstrings, and section headers and
+  fix any that no longer match — counts ("the two tags"), format lists, file
+  offsets, and described control flow drift silently otherwise. A stale comment is
+  a bug.
 - **Match the existing code's style** — terse, dependency-free, header-only Exif
   seeks, small pure functions. No new third-party packages.
 - **Test against the real card or a scratch dir.** A dry run against the mounted
