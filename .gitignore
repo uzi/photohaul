@@ -1,6 +1,12 @@
 # Photos & sidecars — never committed
 *.arw
 *.ARW
+*.raf
+*.RAF
+*.cr3
+*.CR3
+*.nef
+*.NEF
 *.xmp
 *.jpg
 *.jpeg
