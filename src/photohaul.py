@@ -19,7 +19,6 @@
 # Zero dependencies: stdlib only.
 
 import argparse
-import calendar
 import configparser
 import json
 import os
@@ -465,7 +464,12 @@ def scan_source(card, ext):
 
 CONFIG_PATH     = os.path.expanduser('~/.photohaul')
 TEMPLATE_NAME   = 'photohaul.json'
-TEMPLATE_KEYS   = ['teamA', 'teamB', 'event', 'venue', 'location', 'credit']
+# Folder-level shoot scaffold. Caption-text keys + structured IPTC keys (city/state/
+# country, credit/source, rightsUsage/assignment) + keyword sources (teams, sport,
+# conference). See docs/20260606_iptc_fields_plan.md.
+TEMPLATE_KEYS   = ['sport', 'event', 'homeTeam', 'awayTeam', 'homeShort', 'awayShort',
+                   'venue', 'city', 'state', 'country', 'conference',
+                   'credit', 'source', 'rightsUsage', 'assignment']
 DEFAULT_PROFILE = 'default'
 
 
@@ -533,32 +537,45 @@ def capture_year(captured):
     return captured.split(':', 1)[0]
 
 
-def caption_date(captured):
-    """'2026:05:26 14:00:24' -> 'May 26, 2026'."""
-    y, m, d = (int(x) for x in captured.split(' ', 1)[0].split(':'))
-    return '%s %d, %d' % (calendar.month_name[m], d, y)
+# AP date style: weekday, then month abbreviated except March-July (spelled out),
+# then day, year. Names are hardcoded (not strftime) so the caption stays English
+# AP style regardless of the host LC_TIME locale. Index 0 of months is a placeholder
+# so the 1-based month number indexes directly; weekdays follow date.weekday() (Mon=0).
+_AP_MONTHS = ['', 'Jan.', 'Feb.', 'March', 'April', 'May', 'June', 'July',
+              'Aug.', 'Sept.', 'Oct.', 'Nov.', 'Dec.']
+_WEEKDAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+
+
+def ap_date(captured):
+    """'2025:10:03 14:00:24' -> 'Friday, Oct. 3, 2025' (AP caption date)."""
+    d = datetime.strptime(captured.split(' ', 1)[0], '%Y:%m:%d')
+    return '%s, %s %d, %d' % (_WEEKDAYS[d.weekday()], _AP_MONTHS[d.month], d.day, d.year)
 
 
 def build_caption(template, date_str, config):
-    """Assemble a caption from the template, omitting any blank field.
+    """Assemble the folder-level context caption (AP style), omitting blank fields.
 
-    Date attaches to the end of the context sentence; the 'Photo by' byline is
-    only added when there is real context (so an empty template yields nothing).
+    This is the constant scaffold for the whole shoot - "{home} vs {away}, {event},
+    at {venue}, {city}, {state} on {date}. (Photo by {credit})". The per-image action
+    sentence and player IDs are added by hand later in Lightroom. Country is in the
+    structured photoshop:Country field, not the caption text (AP omits it domestically).
+    An empty template yields nothing.
     """
     def g(key):
         v = template.get(key)
         return v.strip() if isinstance(v, str) else ''
 
     parts = []
-    if g('teamA') and g('teamB'):
-        parts.append('%s vs %s' % (g('teamA'), g('teamB')))
+    if g('homeShort') and g('awayShort'):
+        parts.append('%s vs %s' % (g('homeShort'), g('awayShort')))
     if g('event'):
         parts.append(g('event'))
     place = []
     if g('venue'):
         place.append('at ' + g('venue'))
-    if g('location'):
-        place.append(g('location'))
+    locale = ', '.join(p for p in (g('city'), g('state')) if p)
+    if locale:
+        place.append(locale)
     if place:
         parts.append(', '.join(place))
 
@@ -571,7 +588,7 @@ def build_caption(template, date_str, config):
     if sentence:
         out.append(sentence + '.')
         if credit:
-            out.append('Photo by %s.' % credit)
+            out.append('(Photo by %s)' % credit)
     return ' '.join(out)
 
 
@@ -602,7 +619,8 @@ _EXTRA_NS = {
     'Iptc4xmpCore': 'http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/',
     'Iptc4xmpExt':  'http://iptc.org/std/Iptc4xmpExt/2008-02-29/',
 }
-for _p, _u in {**XMP_NS, **_EXTRA_NS}.items():
+_ALL_NS = {**XMP_NS, **_EXTRA_NS}
+for _p, _u in _ALL_NS.items():
     ET.register_namespace(_p, _u)
 _XML_LANG = '{http://www.w3.org/XML/1998/namespace}lang'
 
@@ -623,7 +641,7 @@ class SidecarParseError(Exception):
 
 
 def _q(prefix, local):
-    return '{%s}%s' % (XMP_NS[prefix], local)
+    return '{%s}%s' % (_ALL_NS[prefix], local)
 
 
 def _clear_prop(descs, qname):
@@ -651,6 +669,31 @@ def _set_alt(desc, qname, value):
     li.text = value
 
 
+def _set_simple(desc, qname, value):
+    ET.SubElement(desc, qname).text = value
+
+
+def _set_bag(desc, qname, values):
+    bag = ET.SubElement(ET.SubElement(desc, qname), _q('rdf', 'Bag'))
+    for v in values:
+        ET.SubElement(bag, _q('rdf', 'li')).text = v
+
+
+# Simple-text IPTC fields: fields-dict key -> XMP (prefix, local). photoshop:Credit is
+# the agency attribution line (distinct from the dc:creator byline); Iptc4xmpCore:Location
+# is the sublocation (the venue within the city).
+_SIMPLE_IPTC = [
+    ('headline',     ('photoshop', 'Headline')),
+    ('credit',       ('photoshop', 'Credit')),
+    ('source',       ('photoshop', 'Source')),
+    ('city',         ('photoshop', 'City')),
+    ('state',        ('photoshop', 'State')),
+    ('country',      ('photoshop', 'Country')),
+    ('location',     ('Iptc4xmpCore', 'Location')),
+    ('instructions', ('photoshop', 'Instructions')),
+]
+
+
 def read_label(sidecar):
     """Return the xmp:Label of an existing sidecar (attribute or element form), else None.
 
@@ -676,7 +719,10 @@ def read_label(sidecar):
 def write_sidecar(sidecar, fields, merge):
     """Write our XMP properties into `sidecar`.
 
-    fields: {'label','rights','creator','description'} (falsy = leave unset).
+    fields keys (any falsy value = leave unset): 'label', 'rights', 'creator',
+    'description', 'usage_terms', 'keywords' (a list), plus the simple-text IPTC keys
+    in _SIMPLE_IPTC ('headline','credit','source','city','state','country','location',
+    'instructions').
     merge=False -> create-if-absent (an existing sidecar is left untouched).
     merge=True  -> set only our properties, preserving everything else (e.g.
                    Lightroom develop edits).
@@ -714,6 +760,18 @@ def write_sidecar(sidecar, fields, merge):
     if fields.get('description'):
         _clear_prop(descs, _q('dc', 'description'))
         _set_alt(target, _q('dc', 'description'), fields['description'])
+    if fields.get('usage_terms'):
+        _clear_prop(descs, _q('xmpRights', 'UsageTerms'))   # lang-Alt, like dc:rights
+        _set_alt(target, _q('xmpRights', 'UsageTerms'), fields['usage_terms'])
+    for key, (prefix, local) in _SIMPLE_IPTC:
+        if fields.get(key):
+            q = _q(prefix, local)
+            _clear_prop(descs, q)
+            _set_simple(target, q, fields[key])
+    if fields.get('keywords'):
+        q = _q('dc', 'subject')
+        _clear_prop(descs, q)
+        _set_bag(target, q, fields['keywords'])
 
     body = ET.tostring(root, encoding='unicode')
     tmp = sidecar + '.tmp'
@@ -995,7 +1053,7 @@ class Haul:
         if self.config.get('copyright') or self.config.get('creator'):
             meta.append('rights')
         if self.template is not None:
-            meta.append('caption')
+            meta.append('caption + IPTC')
         if meta:
             print('Metadata: %s%s' % (', '.join(meta),
                                       ' (rewrite/merge)' if self.rewrite else ''))
@@ -1025,15 +1083,22 @@ class Haul:
         return progress
 
     def fields_for(self, frame):
-        """The sidecar properties this frame should carry, given config + template."""
+        """The sidecar properties this frame should carry, given config + template.
+
+        Rights/creator come from ~/.photohaul; the caption and the structured IPTC
+        fields come from the per-folder template (only when one is present, so personal
+        shots with no photohaul.json stay minimal).
+        """
         rights = None
         if self.config.get('copyright'):
             rights = self.config['copyright'].replace('{year}',
                                                        capture_year(frame.captured))
         description = None
+        extra = {}
         if self.template is not None:
-            description = build_caption(self.template, caption_date(frame.captured),
+            description = build_caption(self.template, ap_date(frame.captured),
                                         self.config) or None
+            extra = self._iptc_fields()
         return {
             # Under --rewrite we never set a label: write_sidecar(merge) leaves any
             # existing Purple untouched, and we can't know lock status without the card.
@@ -1041,7 +1106,49 @@ class Haul:
             'rights':      rights,
             'creator':     self.config.get('creator') or None,
             'description': description,
+            **extra,
         }
+
+    def _iptc_fields(self):
+        """Folder-constant IPTC structured fields from the template (with the config
+        credit/creator as the photoshop:Credit fallback, matching the caption byline)."""
+        def g(key):
+            v = self.template.get(key)
+            return (v.strip() if isinstance(v, str) else '') or None
+        credit = g('credit') or self.config.get('credit') or self.config.get('creator')
+        return {
+            'headline':     self._headline(),
+            'credit':       credit or None,
+            'source':       g('source'),
+            'city':         g('city'),
+            'state':        g('state'),
+            'country':      g('country'),
+            'location':     g('venue'),     # Iptc4xmpCore:Location = sublocation
+            'instructions': g('assignment'),
+            'usage_terms':  g('rightsUsage'),
+            'keywords':     self._keywords(),
+        }
+
+    def _headline(self):
+        """'{homeShort} vs {awayShort} {sport}', else the event, else None."""
+        def g(key):
+            v = self.template.get(key)
+            return v.strip() if isinstance(v, str) else ''
+        home, away, sport = g('homeShort'), g('awayShort'), g('sport')
+        if home and away:
+            base = '%s vs %s' % (home, away)
+            return ('%s %s' % (base, sport)) if sport else base
+        return g('event') or None
+
+    def _keywords(self):
+        """Deterministic dc:subject Bag from the team/sport/conference keys (deduped)."""
+        seen = []
+        for key in ('sport', 'homeShort', 'awayShort', 'homeTeam', 'awayTeam', 'conference'):
+            v = self.template.get(key)
+            v = v.strip() if isinstance(v, str) else ''
+            if v and v not in seen:
+                seen.append(v)
+        return seen or None
 
     def would_write(self, frame):
         """For a frame, whether a sidecar would be written and if it's a Purple one."""
@@ -1162,16 +1269,21 @@ def build_parser():
             '  copyright = (c) {year} Your Name   -> dc:rights ({year} = capture year)\n'
             '  [work]\n'
             '  copyright = (c) {year} Your Name / site.com\n'
-            '  credit    = Your Name/site.com     -> default caption byline\n'
+            '  credit    = Your Name/site.com     -> caption byline + photoshop:Credit\n'
             '\n'
             'profile: --profile NAME, else "profile" in photohaul.json, else [default].\n'
             '  A folder with no template stays on [default] (e.g. personal, unbranded).\n'
             '\n'
-            'caption template (photohaul.json in the destination, auto-detected):\n'
-            '  keys: profile, teamA, teamB, event, venue, location, credit (blanks\n'
-            '  omitted from the caption).\n'
-            '  --> "Team A vs Team B, Event, at Venue, City, ST on May 30, 2026.\n'
-            '       Photo by Your Name/site.com."\n'
+            'caption + IPTC template (photohaul.json in the destination, auto-detected):\n'
+            '  keys: profile; sport, event, homeTeam, awayTeam, homeShort, awayShort,\n'
+            '  venue, city, state, country, conference; credit, source, rightsUsage,\n'
+            '  assignment (blanks omitted). Writes the AP-style caption plus structured\n'
+            '  IPTC fields (Headline, Credit, Source, City/State/Country, Location,\n'
+            '  Instructions, UsageTerms, keywords) editors and wire desks expect. The\n'
+            '  per-image action sentence + player IDs stay a manual Lightroom pass.\n'
+            '  --> "Lakeside vs Riverside, NCAA women\'s volleyball match, at\n'
+            '       Memorial Arena, Springfield, Calif. on Friday, Oct. 3, 2025.\n'
+            '       (Photo by Your Name/site.com)"\n'
             '\n'
             'capture-time correction (photohaul.json, optional; corrects the copy only):\n'
             '  time_shift: "+2h30m"   drift fix - nudge the wall-clock time (units\n'

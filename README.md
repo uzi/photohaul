@@ -64,32 +64,60 @@ then a `"profile"` key in the folder's `photohaul.json`, then `[default]`. A fol
 with no template stays on `[default]` — so personal shots never pick up the
 branded copyright. (A section-less legacy config is read as `[default]`.)
 
-**Per-shoot captions** come from a `photohaul.json` in the destination folder,
-auto-detected on ingest. Scaffold a blank one with `photohaul --init-template`:
+**Per-shoot caption + IPTC fields** come from a `photohaul.json` in the
+destination folder, auto-detected on ingest. Scaffold a blank one with `photohaul
+--init-template`:
 
 ```json
 {
   "profile": "",
-  "teamA": "",
-  "teamB": "",
+  "sport": "",
   "event": "",
+  "homeTeam": "",
+  "awayTeam": "",
+  "homeShort": "",
+  "awayShort": "",
   "venue": "",
-  "location": "",
+  "city": "",
+  "state": "",
+  "country": "",
+  "conference": "",
   "credit": "",
+  "source": "",
+  "rightsUsage": "",
+  "assignment": "",
   "time_shift": "",
   "shot_tz": ""
 }
 ```
 
-Blank caption fields are omitted (`profile` selects the rights preset, and
-`time_shift` / `shot_tz` are the capture-time correction below — none are part of
-the caption text). A fully filled template yields, in
-`dc:description`:
+Blank fields are omitted (`profile` selects the rights preset; `time_shift` /
+`shot_tz` are the capture-time correction below). From these, photohaul writes an
+AP-style caption **and** the structured IPTC fields a photo desk / SID workflow
+expects, all into the sidecar:
 
-> Team A vs Team B, Event, at Venue, City, ST on May 30, 2026. Photo by Your Name/yoursite.com.
+| Field | XMP property | From |
+|-------|--------------|------|
+| Caption | `dc:description` | assembled (below) |
+| Headline | `photoshop:Headline` | `homeShort` vs `awayShort` + `sport` |
+| Credit | `photoshop:Credit` | `credit` (→ config `credit`/`creator`) |
+| Source | `photoshop:Source` | `source` |
+| City / State / Country | `photoshop:City` / `:State` / `:Country` | as typed |
+| Location (sublocation) | `Iptc4xmpCore:Location` | `venue` |
+| Instructions | `photoshop:Instructions` | `assignment` |
+| Rights usage terms | `xmpRights:UsageTerms` | `rightsUsage` |
+| Keywords | `dc:subject` | sport, teams, conference |
 
-(`date` is auto-filled per frame; `credit` falls back to the config `credit`,
-then `creator`.)
+`city`/`state`/`country` are written verbatim — put "Calif." there if you want
+"Calif." in the file. A fully filled template yields, in `dc:description`:
+
+> Lakeside vs Riverside, NCAA women's volleyball match, at Memorial Arena, Springfield, Calif. on Friday, Oct. 3, 2025. (Photo by Your Name/yoursite.com)
+
+The date is auto-filled per frame in **AP style** (weekday + abbreviated month,
+except March–July spelled out); `credit` falls back to the config `credit`, then
+`creator`. This caption is the **folder-level scaffold** — the per-image action
+sentence and player IDs (e.g. "Jane Doe (7) goes up for a kill …") stay a manual
+Lightroom pass; photohaul writes only what's constant for the shoot.
 
 ## Capture-time correction (clock drift & timezone)
 

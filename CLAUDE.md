@@ -6,7 +6,9 @@ Guidance for working in this repo.
 `photohaul` — a single-file Python 3 CLI (`src/photohaul.py`) that ingests photos
 off a mounted camera card into a folder, renames them to a stable
 millisecond-precise timestamp, and writes Lightroom-friendly XMP sidecars
-(color label, copyright/creator, caption). Reads Exif from Sony ARW, Nikon NEF,
+(color label, copyright/creator, an AP-style caption, and the structured IPTC
+fields a photo desk expects — headline, credit/source, city/state/country,
+location, usage terms, keywords). Reads Exif from Sony ARW, Nikon NEF,
 Fuji RAF, Canon CR3, and JPEG. **Zero dependencies** — stdlib only, including a
 hand-rolled Exif reader (TIFF, plus the RAF/CR3 containers) and XMP writer. No
 exiftool, no pip installs.
@@ -36,9 +38,13 @@ The script is run from a destination folder; it's copied to `~/bin` by hand.
   (overridden by the CLI positional; no built-in default) and **rights** (creator
   / copyright / credit); `{year}` in copyright expands to the capture year. See
   `docs/20260605_profiles_plan.md`.
-- `photohaul.json` in the destination — per-folder caption template (teamA,
-  teamB, event, venue, location, credit) plus `profile`, and the capture-time
-  correction keys `time_shift` / `shot_tz`. Scaffolded by `--init-template`.
+- `photohaul.json` in the destination — the per-folder shoot scaffold:
+  caption/IPTC keys (sport, event, homeTeam/awayTeam,
+  homeShort/awayShort, venue, city, state, country, conference, credit, source,
+  rightsUsage, assignment) plus `profile`, and the capture-time correction keys
+  `time_shift` / `shot_tz`. Caption is AP-style; the per-image action sentence
+  stays a manual Lightroom pass. Scaffolded by `--init-template`. See
+  `docs/20260606_iptc_fields_plan.md`.
 
 ## `--rewrite` is card-free
 `--rewrite` is a destination-only metadata refresh: no card, no copying. It scans
