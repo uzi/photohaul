@@ -4,18 +4,19 @@ Guidance for working in this repo.
 
 ## What this is
 `photohaul` — a single-file Python 3 CLI (`src/photohaul.py`) that ingests photos
-off a mounted Sony camera card into a folder, renames them to a stable
+off a mounted camera card into a folder, renames them to a stable
 millisecond-precise timestamp, and writes Lightroom-friendly XMP sidecars
-(color label, copyright/creator, caption). **Zero dependencies** — stdlib only,
-including a tiny hand-rolled TIFF/Exif reader and XMP writer. No exiftool, no
-pip installs.
+(color label, copyright/creator, caption). Reads Exif from Sony ARW, Nikon NEF,
+Fuji RAF, Canon CR3, and JPEG. **Zero dependencies** — stdlib only, including a
+hand-rolled Exif reader (TIFF, plus the RAF/CR3 containers) and XMP writer. No
+exiftool, no pip installs.
 
 The script is run from a destination folder; it's copied to `~/bin` by hand.
 
 ## Invariants — do not break these
 - **The card is read-only.** It is never written to or modified. Lock detection
-  is `os.stat(...).st_flags & UF_IMMUTABLE` (Sony's in-camera protect bit), a
-  read.
+  is `os.stat(...).st_flags & UF_IMMUTABLE` (the camera's in-camera protect bit;
+  verified on Sony and Fuji), a read.
 - **Re-runs are idempotent.** Destination names derive purely from intrinsic
   capture time, and a present file of matching size is skipped; a different size
   is a reported conflict, never overwritten. Anything that makes names depend on
@@ -31,9 +32,10 @@ The script is run from a destination folder; it's copied to `~/bin` by hand.
 
 ## Configuration surfaces
 - `~/.photohaul` — INI, parsed with `configparser` (`interpolation=None`).
-  `[default]` is inherited by named profile sections. Holds **rights** only
-  (creator / copyright / credit); `{year}` in copyright expands to the capture
-  year. See `docs/20260605_profiles_plan.md`.
+  `[default]` is inherited by named profile sections. Holds the default `format`
+  (overridden by the CLI positional; no built-in default) and **rights** (creator
+  / copyright / credit); `{year}` in copyright expands to the capture year. See
+  `docs/20260605_profiles_plan.md`.
 - `photohaul.json` in the destination — per-folder caption template (teamA,
   teamB, event, venue, location, credit) plus `profile`, and (planned)
   `time_shift`. Scaffolded by `--init-template`.

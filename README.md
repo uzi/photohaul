@@ -4,21 +4,24 @@ A fast, dependency-free CLI for ingesting photos off a camera card.
 
 Copies raw files from a mounted card into the current folder, renaming each to a
 stable, millisecond-precise name derived from its Exif capture time
-(`YYYYMMDD-hhmmss_mmm.ext`, e.g. `20260526-140024_708.arw`). Because the name
+(`YYYYMMDD-hhmmss_mmm.ext`, e.g. `20260526-140024_708.ext`). Because the name
 comes only from the frame's own metadata, re-running on the same card just skips
 what already landed.
 
-Pick the format with the `extension` argument (default `arw`). photohaul reads
-Exif natively (no exiftool) from each of:
+Pick the format with the `format` argument (e.g. `photohaul nef`), or set a
+default `format` in `~/.photohaul` (below) and just run `photohaul`. The argument
+wins when both are present; there is no built-in default, so with neither set
+photohaul reports an error rather than guessing. photohaul reads Exif natively
+(no exiftool) from each of:
 
 - **ARW** (Sony) and **NEF** (Nikon) — TIFF at byte zero.
 - **RAF** (Fuji) — Exif lives in an embedded JPEG, read transparently.
 - **CR3** (Canon) — an MP4-style container; the Exif is pulled from its `moov`
   metadata box.
 
-So `photohaul raf`, `photohaul nef`, or `photohaul cr3` ingests that card the
-same way as ARW — stable naming, byte-exact copies, and (where the camera's
-in-camera Protect maps to the macOS lock bit) Purple-labelling protected frames.
+So `photohaul <format>` ingests any of them the same way — stable naming,
+byte-exact copies, and (where the camera's in-camera Protect maps to the macOS
+lock bit) Purple-labelling of protected frames.
 
 Frames locked (protected) in-camera are detected, copied unlocked, and tagged
 with a Purple color label for Lightroom via an `.xmp` sidecar. **The card is
@@ -26,7 +29,7 @@ never modified.**
 
 ## Usage
 
-    src/photohaul.py [extension] [--source PATH] [--dest PATH]
+    src/photohaul.py [format] [--source PATH] [--dest PATH]
                      [--locked | --unlocked | --all]
                      [--dry-run] [--rewrite] [--init-template]
 
@@ -44,6 +47,7 @@ Missing file or field → simply not written:
 
 ```ini
 [default]
+format    = arw                    ; default format when none is given on the CLI
 creator   = Your Name              ; -> dc:creator
 copyright = © {year} Your Name     ; -> dc:rights  ({year} = capture year)
 

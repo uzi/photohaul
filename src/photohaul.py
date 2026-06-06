@@ -2,10 +2,11 @@
 #
 # photohaul - ingest photos from a mounted camera card.
 #
-# Copies raw files off the card (default *.ARW; the extension arg also selects Nikon
-# NEF, Fuji RAF, Canon CR3, JPEG, ...) into the current folder, renaming each to a
-# stable YYYYMMDD-hhmmss_mmm.ext name derived from Exif (millisecond timestamp = unique
-# key, so names are identical no matter which subset is copied -> safe partial/repeat).
+# Copies raw files off the card (format named on the CLI or via 'format=' in
+# ~/.photohaul - Sony ARW, Nikon NEF, Fuji RAF, Canon CR3, JPEG) into the current
+# folder, renaming each to a stable YYYYMMDD-hhmmss_mmm.ext name derived from Exif
+# (millisecond timestamp = unique key, so names are identical no matter which subset
+# is copied -> safe partial/repeat runs).
 # In-camera "locked" frames (the FAT read-only bit, surfaced on macOS as the uchg flag)
 # are detected, copied unlocked, and marked Purple for Lightroom via an .xmp sidecar.
 # Copyright/creator (from ~/.photohaul) and a per-folder caption template
@@ -882,7 +883,7 @@ def build_parser():
             'Ingest photos from a mounted camera card into the current folder.\n'
             '\n'
             'Each file is copied and renamed to a stable, millisecond-precise name\n'
-            'from its Exif capture time (e.g. 20260526-140024_708.arw). Re-running\n'
+            'from its Exif capture time (e.g. 20260526-140024_708.ext). Re-running\n'
             'skips files already present, so it is safe to repeat on the same card.\n'
             '\n'
             'Frames locked (protected) in-camera are detected, copied unlocked, and\n'
@@ -892,11 +893,10 @@ def build_parser():
             'modified, and the raw stays a byte-exact clone of the card original.'),
         epilog=(
             'examples:\n'
-            '  photohaul                    # copy all ARW from the card into cwd\n'
+            '  photohaul                    # use format= from ~/.photohaul\n'
+            '  photohaul [format]           # or name it: arw Sony, cr3 Canon, nef Nikon, raf Fuji, jpg\n'
             '  photohaul --dry-run          # show what would happen, touch nothing\n'
             '  photohaul --locked           # only the featured (locked) frames\n'
-            '  photohaul jpg                # ingest .JPG instead of .ARW\n'
-            '  photohaul raf                # Fuji .RAF (also: nef Nikon, cr3 Canon)\n'
             '  photohaul --init-template    # scaffold a blank photohaul.json here\n'
             '  photohaul --rewrite          # refresh copyright/caption sidecars (no card)\n'
             '  photohaul --profile personal # apply a named rights preset\n'
@@ -904,6 +904,7 @@ def build_parser():
             '\n'
             'config file (~/.photohaul, optional, INI; [default] inherited by profiles):\n'
             '  [default]\n'
+            '  format    = arw                    -> default format when none is given\n'
             '  creator   = Your Name              -> dc:creator\n'
             '  copyright = (c) {year} Your Name   -> dc:rights ({year} = capture year)\n'
             '  [work]\n'
@@ -920,9 +921,8 @@ def build_parser():
             '       Photo by Your Name/site.com."\n'
             '\n'
             'notes:\n'
-            '  - Formats: TIFF-based raws (Sony ARW, Nikon NEF) and JPEG, plus Fuji RAF\n'
-            '    (Exif in an embedded JPEG) and Canon CR3 (Exif in its MP4-style moov\n'
-            '    box). The extension picks the format.\n'
+            '  - Exif is read natively: TIFF raws (ARW, NEF) and JPEG directly, Fuji\n'
+            '    RAF from its embedded JPEG, Canon CR3 from its MP4-style moov box.\n'
             '  - The card is read-only here; it is never written to or modified.\n'
             '  - A same-named file of matching size is skipped; one of different size\n'
             '    is reported as a conflict and never overwritten.\n'
@@ -932,8 +932,9 @@ def build_parser():
             '  - --rewrite works on the destination only - no card needed and nothing\n'
             '    copied. A Purple label already in a sidecar is kept; it is never added\n'
             '    or removed (lock status is unknown without the card).'))
-    ap.add_argument('extension', nargs='?', default='arw',
-                    help='file extension to ingest (default: arw; also raf, nef, cr3, jpg)')
+    ap.add_argument('extension', nargs='?', default=None, metavar='format',
+                    help="raw/jpeg format to ingest (arw, cr3, nef, raf, jpg); overrides "
+                         "'format' in ~/.photohaul. No built-in default.")
     ap.add_argument('--source', help='card root (default: auto-detect under /Volumes)')
     ap.add_argument('--dest', default='.', help='destination dir (default: cwd)')
     sel = ap.add_mutually_exclusive_group()
@@ -962,7 +963,6 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
 
-    ext = args.extension.lstrip('.')
     dest_dir = os.path.abspath(args.dest)
 
     if args.init_template:
@@ -972,6 +972,16 @@ def main():
     if args.rewrite and args.filter != 'all':
         sys.exit("Error: --rewrite cannot be combined with --locked/--unlocked "
                  "(lock status isn't available without the card)")
+
+    template = load_template(dest_dir)
+    profile = args.profile or (template or {}).get('profile') or DEFAULT_PROFILE
+    config = load_config(profile)
+
+    # Format: the positional overrides the config; there is no built-in default.
+    ext = (args.extension or config.get('format') or '').lstrip('.').lower()
+    if not ext:
+        sys.exit("Error: no format given. Pass one (e.g. 'photohaul arw') or set "
+                 "'format = arw' in ~/.photohaul.")
 
     if args.rewrite:
         # Metadata-only refresh of the destination; the card is not used.
@@ -985,11 +995,9 @@ def main():
         if not scan_source(card, ext):
             sys.exit("Error: no .%s files found under %s/DCIM" % (ext, card))
 
-    template = load_template(dest_dir)
-    profile = args.profile or (template or {}).get('profile') or DEFAULT_PROFILE
     return Haul(card=card, ext=ext, dest_dir=dest_dir, filt=args.filter,
                 dry_run=args.dry_run, rewrite=args.rewrite,
-                config=load_config(profile), template=template,
+                config=config, template=template,
                 profile=profile).run()
 
 
