@@ -36,15 +36,44 @@ EXIF_IFD_PTR      = 0x8769
 DATETIME_ORIGINAL = 0x9003
 SUBSEC_ORIGINAL   = 0x9291
 _TYPE_SIZES = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 7: 1, 9: 4, 10: 8}
+FUJI_MAGIC        = b'FUJIFILMCCD-RAW'
+RAF_JPEG_OFFSET   = 0x54   # RAF header field: file offset of the embedded JPEG (BE u32)
+
+
+def _exif_tiff_base(f):
+    """File offset of the Exif TIFF header.
+
+    0 for a TIFF-at-start file (ARW, JPEG-less TIFF). A Fuji RAF is not a TIFF;
+    its Exif lives in an embedded JPEG, so follow the header's JpgImageOffset and
+    walk the JPEG's APP1/Exif segment to the TIFF header inside it.
+    """
+    if f.read(len(FUJI_MAGIC)) != FUJI_MAGIC:
+        return 0
+    f.seek(RAF_JPEG_OFFSET)
+    (jpg_off,) = struct.unpack('>I', f.read(4))
+    f.seek(jpg_off)
+    if f.read(2) != b'\xff\xd8':                       # JPEG SOI
+        raise ValueError('RAF: no embedded JPEG')
+    while True:
+        marker = f.read(2)
+        if len(marker) < 2 or marker[0] != 0xFF or marker == b'\xff\xd9':
+            raise ValueError('RAF: no Exif in embedded JPEG')
+        (seglen,) = struct.unpack('>H', f.read(2))
+        seg_start = f.tell()
+        if marker == b'\xff\xe1' and f.read(6) == b'Exif\x00\x00':
+            return f.tell()                            # TIFF header begins here
+        f.seek(seg_start + seglen - 2)                 # skip to next marker (incl. XMP APP1)
 
 
 def read_exif_datetime(path):
-    """Return (datetime_str, subsec_str_or_None) from a TIFF-structured raw/jpeg.
+    """Return (datetime_str, subsec_str_or_None) from a TIFF-structured raw/jpeg or RAF.
 
     Reads only the header and the two relevant IFDs via seeks - never the whole file.
     Raises ValueError on anything it can't parse.
     """
     with open(path, 'rb') as f:
+        base = _exif_tiff_base(f)                       # 0 for TIFF/ARW; embedded for RAF
+        f.seek(base)
         head = f.read(8)
         if head[:2] == b'II':
             bo = '<'
@@ -58,7 +87,7 @@ def read_exif_datetime(path):
         (ifd0,) = struct.unpack(bo + 'I', head[4:8])
 
         def read_ifd(off):
-            f.seek(off)
+            f.seek(base + off)
             (n,) = struct.unpack(bo + 'H', f.read(2))
             raw = f.read(n * 12)
             entries = {}
@@ -74,7 +103,7 @@ def read_exif_datetime(path):
                 data = valoff[:size]
             else:
                 (o,) = struct.unpack(bo + 'I', valoff)
-                f.seek(o)
+                f.seek(base + o)
                 data = f.read(size)
             return data.split(b'\x00')[0].decode('ascii', 'replace')
 
@@ -806,6 +835,7 @@ def build_parser():
             '  photohaul --dry-run          # show what would happen, touch nothing\n'
             '  photohaul --locked           # only the featured (locked) frames\n'
             '  photohaul jpg                # ingest .JPG instead of .ARW\n'
+            '  photohaul raf                # ingest Fuji .RAF (Exif read from its JPEG)\n'
             '  photohaul --init-template    # scaffold a blank photohaul.json here\n'
             '  photohaul --rewrite          # refresh copyright/caption sidecars (no card)\n'
             '  photohaul --profile personal # apply a named rights preset\n'
@@ -829,6 +859,8 @@ def build_parser():
             '       Photo by Your Name/site.com."\n'
             '\n'
             'notes:\n'
+            '  - Formats: any Exif-bearing TIFF raw (Sony ARW) or JPEG, plus Fuji RAF\n'
+            '    (Exif is read from its embedded JPEG). The extension picks the format.\n'
             '  - The card is read-only here; it is never written to or modified.\n'
             '  - A same-named file of matching size is skipped; one of different size\n'
             '    is reported as a conflict and never overwritten.\n'
@@ -839,7 +871,7 @@ def build_parser():
             '    copied. A Purple label already in a sidecar is kept; it is never added\n'
             '    or removed (lock status is unknown without the card).'))
     ap.add_argument('extension', nargs='?', default='arw',
-                    help='file extension to ingest (default: arw)')
+                    help='file extension to ingest (default: arw; e.g. raf for Fuji, jpg)')
     ap.add_argument('--source', help='card root (default: auto-detect under /Volumes)')
     ap.add_argument('--dest', default='.', help='destination dir (default: cwd)')
     sel = ap.add_mutually_exclusive_group()
