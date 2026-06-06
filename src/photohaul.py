@@ -560,7 +560,7 @@ def ap_date(captured):
 def build_caption(template, date_str, config):
     """Assemble the folder-level context caption (AP style), omitting blank fields.
 
-    This is the constant scaffold for the whole shoot - "{home} vs {away}, {event},
+    This is the constant scaffold for the whole shoot - "{home} vs. {away}, {event},
     at {venue}, {city}, {state} on {date}. (Photo by {credit})". The per-image action
     sentence and player IDs are added by hand later in Lightroom. Country is in the
     structured photoshop:Country field, not the caption text (AP omits it domestically).
@@ -572,7 +572,7 @@ def build_caption(template, date_str, config):
 
     parts = []
     if g('homeShort') and g('awayShort'):
-        parts.append('%s vs %s' % (g('homeShort'), g('awayShort')))
+        parts.append('%s vs. %s' % (g('homeShort'), g('awayShort')))
     if g('event'):
         parts.append(g('event'))
     place = []
@@ -1146,13 +1146,13 @@ class Haul:
         return self._iptc
 
     def _headline(self):
-        """'{homeShort} vs {awayShort} {sport}', else the event, else None."""
+        """'{homeShort} vs. {awayShort} {sport}', else the event, else None."""
         def g(key):
             v = self.template.get(key)
             return v.strip() if isinstance(v, str) else ''
         home, away, sport = g('homeShort'), g('awayShort'), g('sport')
         if home and away:
-            base = '%s vs %s' % (home, away)
+            base = '%s vs. %s' % (home, away)
             return ('%s %s' % (base, sport)) if sport else base
         return g('event') or None
 
@@ -1298,7 +1298,7 @@ def build_parser():
             '  IPTC fields (Headline, Credit, Source, City/State/Country, Location,\n'
             '  Instructions, UsageTerms, keywords) editors and wire desks expect. The\n'
             '  per-image action sentence + player IDs stay a manual Lightroom pass.\n'
-            '  --> "Lakeside vs Riverside, NCAA women\'s volleyball match, at\n'
+            '  --> "Lakeside vs. Riverside, NCAA women\'s volleyball match, at\n'
             '       Memorial Arena, Springfield, Calif. on Friday, Oct. 3, 2025.\n'
             '       (Photo by Your Name/site.com)"\n'
             '\n'

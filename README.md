@@ -58,7 +58,7 @@ copyright = © {year} Your Name / yoursite.com
 credit    = Your Name/yoursite.com ; default caption byline
 ```
 
-**Profiles** let one camera serve multiple contexts (e.g. personal vs work)
+**Profiles** let one camera serve multiple contexts (e.g. personal vs. work)
 with different rights. The active profile is chosen by, in order: `--profile NAME`,
 then a `"profile"` key in the folder's `photohaul.json`, then `[default]`. A folder
 with no template stays on `[default]` — so personal shots never pick up the
@@ -99,7 +99,7 @@ expects, all into the sidecar:
 | Field | XMP property | From |
 |-------|--------------|------|
 | Caption | `dc:description` | assembled (below) |
-| Headline | `photoshop:Headline` | `homeShort` vs `awayShort` + `sport` |
+| Headline | `photoshop:Headline` | `homeShort` vs. `awayShort` + `sport` |
 | Credit | `photoshop:Credit` | `credit` (→ config `credit`/`creator`) |
 | Source | `photoshop:Source` | `source` |
 | City / State / Country | `photoshop:City` / `:State` / `:Country` | as typed |
@@ -111,7 +111,7 @@ expects, all into the sidecar:
 `city`/`state`/`country` are written verbatim — put "Calif." there if you want
 "Calif." in the file. A fully filled template yields, in `dc:description`:
 
-> Lakeside vs Riverside, NCAA women's volleyball match, at Memorial Arena, Springfield, Calif. on Friday, Oct. 3, 2025. (Photo by Your Name/yoursite.com)
+> Lakeside vs. Riverside, NCAA women's volleyball match, at Memorial Arena, Springfield, Calif. on Friday, Oct. 3, 2025. (Photo by Your Name/yoursite.com)
 
 The date is auto-filled per frame in **AP style** (weekday + abbreviated month,
 except March–July spelled out); `credit` falls back to the config `credit`, then
