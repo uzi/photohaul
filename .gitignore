@@ -7,6 +7,8 @@
 *.CR3
 *.nef
 *.NEF
+*.dng
+*.DNG
 *.xmp
 *.jpg
 *.jpeg
