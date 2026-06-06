@@ -11,8 +11,8 @@
 # are detected, copied unlocked, and marked Purple for Lightroom via an .xmp sidecar.
 # Copyright/creator (from ~/.photohaul) and a per-folder template (photohaul.json) -
 # an AP-style caption plus structured IPTC fields (headline, credit/source,
-# city/state/country, location, usage terms, keywords) - are written to the same
-# sidecar. The raw is copied byte-for-byte,
+# city/state/country, location, date created, usage terms, keywords) - are written to
+# the same sidecar. The raw is copied byte-for-byte,
 # the lone exception being an optional capture-time/timezone correction (photohaul.json)
 # that overwrites the copy's EXIF date/offset fields in place at the same byte length -
 # so the copy's size always matches the card original and re-runs stay idempotent.
@@ -557,6 +557,42 @@ def ap_date(captured):
     return '%s, %s %d, %d' % (_WEEKDAYS[d.weekday()], _AP_MONTHS[d.month], d.day, d.year)
 
 
+def iso_datecreated(captured, offset):
+    """'2025:10:03 19:10:25', '-07:00' -> '2025-10-03T19:10:25-07:00' (IPTC DateCreated).
+
+    ISO 8601 from the *corrected* capture time + effective offset, so the structured
+    date agrees with the corrected filename/caption. Offset None (camera recorded none,
+    no shot_tz) -> a zoneless local timestamp.
+    """
+    d = datetime.strptime(captured, _DATE_FMT)
+    return d.strftime('%Y-%m-%dT%H:%M:%S') + (offset or '')
+
+
+# Full state name -> AP caption abbreviation. The eight AP never abbreviates (Alaska,
+# Hawaii, Idaho, Iowa, Maine, Ohio, Texas, Utah) and any unlisted/non-US value pass
+# through unchanged - so a value already typed as "Calif." or a half-filled table still
+# yields a readable caption. Used for the caption text only; photoshop:State keeps the
+# full name the template holds.
+_AP_STATES = {
+    'Alabama': 'Ala.', 'Arizona': 'Ariz.', 'Arkansas': 'Ark.', 'California': 'Calif.',
+    'Colorado': 'Colo.', 'Connecticut': 'Conn.', 'Delaware': 'Del.', 'Florida': 'Fla.',
+    'Georgia': 'Ga.', 'Illinois': 'Ill.', 'Indiana': 'Ind.', 'Kansas': 'Kan.',
+    'Kentucky': 'Ky.', 'Louisiana': 'La.', 'Maryland': 'Md.', 'Massachusetts': 'Mass.',
+    'Michigan': 'Mich.', 'Minnesota': 'Minn.', 'Mississippi': 'Miss.', 'Missouri': 'Mo.',
+    'Montana': 'Mont.', 'Nebraska': 'Neb.', 'Nevada': 'Nev.', 'New Hampshire': 'N.H.',
+    'New Jersey': 'N.J.', 'New Mexico': 'N.M.', 'New York': 'N.Y.', 'North Carolina': 'N.C.',
+    'North Dakota': 'N.D.', 'Oklahoma': 'Okla.', 'Oregon': 'Ore.', 'Pennsylvania': 'Pa.',
+    'Rhode Island': 'R.I.', 'South Carolina': 'S.C.', 'South Dakota': 'S.D.',
+    'Tennessee': 'Tenn.', 'Vermont': 'Vt.', 'Virginia': 'Va.', 'Washington': 'Wash.',
+    'West Virginia': 'W.Va.', 'Wisconsin': 'Wis.', 'Wyoming': 'Wyo.',
+}
+
+
+def _ap_state(name):
+    """Full state name -> AP caption abbreviation; unknown/never-abbreviated -> unchanged."""
+    return _AP_STATES.get(name, name)
+
+
 def build_caption(template, date_str, config):
     """Assemble the folder-level context caption (AP style), omitting blank fields.
 
@@ -578,7 +614,8 @@ def build_caption(template, date_str, config):
     place = []
     if g('venue'):
         place.append('at ' + g('venue'))
-    locale = ', '.join(p for p in (g('city'), g('state')) if p)
+    # State is AP-abbreviated for the caption only; photoshop:State keeps the full name.
+    locale = ', '.join(p for p in (g('city'), _ap_state(g('state'))) if p)
     if locale:
         place.append(locale)
     if place:
@@ -686,7 +723,8 @@ def _set_bag(desc, qname, values):
 
 # Simple-text IPTC fields: fields-dict key -> XMP (prefix, local). photoshop:Credit is
 # the agency attribution line (distinct from the dc:creator byline); Iptc4xmpCore:Location
-# is the sublocation (the venue within the city).
+# is the sublocation (the venue within the city); date_created is per-frame (ISO 8601),
+# the rest folder-constant.
 _SIMPLE_IPTC = [
     ('headline',     ('photoshop', 'Headline')),
     ('credit',       ('photoshop', 'Credit')),
@@ -696,6 +734,7 @@ _SIMPLE_IPTC = [
     ('country',      ('photoshop', 'Country')),
     ('location',     ('Iptc4xmpCore', 'Location')),
     ('instructions', ('photoshop', 'Instructions')),
+    ('date_created', ('photoshop', 'DateCreated')),
 ]
 
 
@@ -727,7 +766,7 @@ def write_sidecar(sidecar, fields, merge):
     fields keys (any falsy value = leave unset): 'label', 'rights', 'creator',
     'description', 'usage_terms', 'keywords' (a list), plus the simple-text IPTC keys
     in _SIMPLE_IPTC ('headline','credit','source','city','state','country','location',
-    'instructions').
+    'instructions','date_created').
     merge=False -> create-if-absent (an existing sidecar is left untouched).
     merge=True  -> set only our properties, preserving everything else (e.g.
                    Lightroom develop edits).
@@ -912,6 +951,7 @@ class Frame:
     dest: str
     captured: str          # corrected Exif datetime, e.g. '2026:05:26 14:00:24'
     date_delta: timedelta = timedelta(0)   # wall-clock shift to patch into the copy
+    offset: str = None     # effective UTC offset ('±HH:MM') for IPTC DateCreated, or None
 
     @property
     def sidecar(self):
@@ -981,8 +1021,11 @@ class Haul:
             else:
                 used_names[base] = 1
             dest = os.path.join(self.dest_dir, base + '.' + self.ext)
+            # Effective offset is shot_tz's target when set (we restamp the tags to it),
+            # else the camera's recorded offset (unchanged without shot_tz).
+            offset = self.shot_tz if self.shot_tz is not None else rec_off
             self.frames.append(Frame(src, st.st_size, locked, dest, dt,
-                                     date_delta=date_delta))
+                                     date_delta=date_delta, offset=offset))
 
     def scan_dest(self):
         """Card-free scan for --rewrite: find already-copied files in the destination
@@ -995,11 +1038,11 @@ class Haul:
         for name in names:
             dest = os.path.join(self.dest_dir, name)
             try:
-                dt, _sub, _off = read_exif_datetime(dest)
+                dt, _sub, off = read_exif_datetime(dest)   # dest already carries corrected offset
             except (ValueError, OSError) as e:
                 self.errors.append('%s: cannot read Exif (%s)' % (name, e))
                 continue
-            frame = Frame(dest, os.path.getsize(dest), False, dest, dt)
+            frame = Frame(dest, os.path.getsize(dest), False, dest, dt, offset=off)
             if read_label(frame.sidecar) == 'Purple':   # preserved as-is; reporting only
                 frame.locked = True
                 self.featured += 1
@@ -1117,6 +1160,9 @@ class Haul:
         if self.template is not None:
             fields['description'] = build_caption(self.template, ap_date(frame.captured),
                                                   self.config) or None
+            # DateCreated is per-frame (capture time + offset), so it stays out of the
+            # cached folder-constant _iptc set.
+            fields['date_created'] = iso_datecreated(frame.captured, frame.offset)
             fields.update(self._iptc_fields())
         return fields
 

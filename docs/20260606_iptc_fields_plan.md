@@ -131,12 +131,22 @@ needed.
 2. AP caption rework (`ap_date`, `build_caption`) + `dc:subject` keywords.
 3. New `--init-template` scaffold + docs.
 
+## Follow-up additions (2026-06-06)
+Two items first deferred were added in a follow-up, since each closed a real
+consistency gap:
+- **`photoshop:DateCreated`** (ISO-8601 + offset). Per-frame, so it lives in `fields_for`
+  (not the cached `_iptc`); `Frame` now carries the effective `offset` (shot_tz target when
+  set, else the recorded offset; the dest's corrected offset under `--rewrite`). Without
+  it the structured date would read raw EXIF while the filename/caption reflect
+  shot_tz/time_shift corrections — they'd disagree.
+- **AP state-abbreviation derivation.** `state` was double-duty: the caption wants the AP
+  abbreviation ("Calif.") but `photoshop:State` wants the full name ("California"). The
+  template now holds the full name (the single source of truth); `_ap_state()` derives the
+  AP abbreviation for the caption text only. Unknown/never-abbreviated values pass through,
+  so a half-filled table never breaks a caption.
+
 ## Non-goals (noted for later)
-- **`photoshop:DateCreated`** (ISO-8601). Free to add — we already compute the corrected
-  instant and effective offset — but not in this pass; would need the effective offset
-  carried on `Frame`.
 - **`dc:title`** (Object Name) — marginal; the filename slug already identifies the file.
-- **AP state-abbreviation derivation** — explicitly skipped; `state` is stored verbatim.
 - **Per-image captioning** (action verb, player numbers) — stays a manual Lightroom pass.
 - **Manifest / copy verification** — a separate effort, not metadata.
 

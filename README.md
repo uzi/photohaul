@@ -102,14 +102,21 @@ expects, all into the sidecar:
 | Headline | `photoshop:Headline` | `homeShort` vs. `awayShort` + `sport` |
 | Credit | `photoshop:Credit` | `credit` (→ config `credit`/`creator`) |
 | Source | `photoshop:Source` | `source` |
-| City / State / Country | `photoshop:City` / `:State` / `:Country` | as typed |
+| City / State / Country | `photoshop:City` / `:State` / `:Country` | as typed (full names) |
 | Location (sublocation) | `Iptc4xmpCore:Location` | `venue` |
 | Instructions | `photoshop:Instructions` | `assignment` |
 | Rights usage terms | `xmpRights:UsageTerms` | `rightsUsage` |
+| Date created | `photoshop:DateCreated` | per-frame, ISO 8601 + offset |
 | Keywords | `dc:subject` | sport, teams, conference |
 
-`city`/`state`/`country` are written verbatim — put "Calif." there if you want
-"Calif." in the file. A fully filled template yields, in `dc:description`:
+`city`/`state`/`country` go into the structured fields as typed, so use full
+names (e.g. `state: "California"`). The **caption** abbreviates the state to AP
+style on its own (`"California"` → `"Calif."`; the eight AP never abbreviates and
+anything unrecognized pass through unchanged) — so `photoshop:State` reads
+"California" while the caption reads "Calif." `photoshop:DateCreated` is derived
+per frame from the (corrected) capture time and offset, so it agrees with the
+filename and caption rather than the raw card EXIF. A fully filled template
+yields, in `dc:description`:
 
 > Lakeside vs. Riverside, NCAA women's volleyball match, at Memorial Arena, Springfield, Calif. on Friday, Oct. 3, 2025. (Photo by Your Name/yoursite.com)
 
