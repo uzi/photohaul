@@ -16,18 +16,22 @@ exiftool, no pip installs.
 The script is run from a destination folder; it's copied to `~/bin` by hand.
 
 ## Invariants — do not break these
-- **The card is read-only.** It is never written to or modified. Lock detection
-  is `os.stat(...).st_flags & UF_IMMUTABLE` (the camera's in-camera protect bit;
-  verified on Sony and Fuji), a read.
-- **Re-runs are idempotent.** Destination names derive purely from intrinsic
-  capture time, and a present file of matching size is skipped; a different size
-  is a reported conflict, never overwritten. Anything that makes names depend on
-  extrinsic input must be deterministic across runs (see capture-time offset).
-- **The raw is a byte-exact clone of the card original** — with exactly one
-  *planned* exception: in-place correction of EXIF date and timezone-offset
-  fields under a capture-time/timezone correction
-  (`docs/20260605_capture_time_offset_plan.md`). If you add
-  another exception, justify it and document it here.
+- **The card is read-only** *(card mode)*. It is never written to or modified. Lock
+  detection is `os.stat(...).st_flags & UF_IMMUTABLE` (the camera's in-camera protect bit;
+  verified on Sony and Fuji), a read. `--local` mode uses no card; it **renames files in
+  place** in the working folder (`docs/20260606_local_mode_plan.md`).
+- **Re-runs are idempotent.** Card mode: destination names derive purely from intrinsic
+  capture time, a present file of matching size is skipped, a different size is a reported
+  conflict, never overwritten. `--local`: a file whose name already matches the timestamp
+  pattern (`_STAMP_RE`) is left alone, so re-runs only touch newly-added camera files.
+  Anything that makes names depend on extrinsic input must be deterministic across runs
+  (see capture-time offset).
+- **The raw is a byte-exact clone of the card original** (card mode; in `--local` the raw
+  *is* the original, only renamed) — with exactly one *planned* exception: in-place
+  correction of EXIF date and timezone-offset fields under a capture-time/timezone
+  correction (`docs/20260605_capture_time_offset_plan.md`), applied in `--local` via a
+  crash-safe copy-patch-replace. If you add another exception, justify it and document it
+  here.
 - **Sidecars are create-if-absent**, and `--rewrite` merges only photohaul's
   fields while preserving everything else (e.g. Lightroom develop edits). An
   unparseable sidecar is reported and left untouched, never clobbered.
@@ -56,6 +60,14 @@ the destination for already-copied files, reads their EXIF, and merges
 rights/creator/caption into existing sidecars. An existing Purple label is
 preserved as-is and never added or removed (lock status is unknown without the
 card). It errors if combined with `--locked`/`--unlocked`.
+
+## `--local` is card-free too (but renames)
+`--local` ingests files already sitting in the destination (you copied them off the card
+by hand — X100VI, Ricoh GR): no card, no copy. It **renames** camera-named files in place
+to the timestamp name and writes create-if-absent sidecars; files already matching the
+timestamp pattern are left alone. Unlike `--rewrite`, it changes filenames (and, under a
+capture-time correction, EXIF). Errors if combined with `--rewrite`, `--source`, or
+`--locked`/`--unlocked`. See `docs/20260606_local_mode_plan.md`.
 
 ## Working conventions
 - **Plans live in `docs/`** as `YYYYMMDD_<name>_plan.md`, with a `Status:` line

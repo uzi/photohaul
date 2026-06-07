@@ -417,6 +417,12 @@ def dsc_number(filename):
     return digits or '0'
 
 
+# A filename stem photohaul itself produced: YYYYMMDD-HHMMSS, optional _ms, optional
+# -dscnumber collision suffix. Used by --local to tell already-renamed files (skip) from
+# camera-named ones (rename) - case-independent, unlike the old uppercase/lowercase trick.
+_STAMP_RE = re.compile(r'^\d{8}-\d{6}(_\d{3})?(-\d+)?$')
+
+
 # ---------------------------------------------------------------------------
 # Lock detection (read-only on source)
 # ---------------------------------------------------------------------------
@@ -987,6 +993,7 @@ class Haul:
     config: dict
     template: dict          # None if no photohaul.json present
     profile: str            # active profile name (DEFAULT_PROFILE if none)
+    local: bool = False     # rename-in-place mode (no card, no copy)
     time_shift: timedelta = timedelta(0)   # drift nudge (forced 0 under --rewrite)
     shot_tz: str = None     # normalized '±HH:MM' target, or None if no tz correction
     shot_tz_delta: timedelta = None         # parsed shot_tz, for deriving zone_delta
@@ -1010,6 +1017,8 @@ class Haul:
         """
         if self.rewrite:
             return self.scan_dest()
+        if self.local:
+            return self.scan_local()
         used_names = {}
         for src in scan_source(self.card, self.ext):
             st = os.stat(src)               # one stat for both lock bit and size
@@ -1065,6 +1074,53 @@ class Haul:
                 self.featured += 1
             self.frames.append(frame)
 
+    def scan_local(self):
+        """Card-free, rename-in-place scan of dest_dir (the --local workflow).
+
+        Lists files with the target extension (non-recursive - a working folder, not a
+        DCIM tree). A stem already matching _STAMP_RE is kept as-is (dest = src, no rename)
+        but still scanned so its sidecar gets create-if-absent attention; a camera-named
+        file gets a computed timestamp dest. Collisions resolve to the deterministic
+        -dscnumber suffix, checked against both earlier frames and files already on disk,
+        so a new frame never lands on an existing name. No lock bit (no card).
+        """
+        suffix = '.' + self.ext.lower()
+        names = sorted(n for n in os.listdir(self.dest_dir)
+                       if n.lower().endswith(suffix)
+                       and os.path.isfile(os.path.join(self.dest_dir, n)))
+        used_names = {}
+        for name in names:
+            src = os.path.join(self.dest_dir, name)
+            stem = os.path.splitext(name)[0]
+            already = bool(_STAMP_RE.match(stem))
+            try:
+                dt, sub, rec_off = read_exif_datetime(src)
+            except (ValueError, OSError) as e:
+                self.errors.append('%s: cannot read Exif (%s)' % (name, e))
+                continue
+            if already:
+                # Keep the existing (already-corrected-or-original) name and time as-is;
+                # re-patching would double-correct, and the file isn't moved.
+                self.frames.append(Frame(src, os.path.getsize(src), False, src, dt,
+                                         date_delta=timedelta(0), offset=rec_off))
+                continue
+            date_delta = self._date_delta(src, rec_off)
+            dt = shift_exif_datetime(dt, date_delta)
+            base = base_name(dt, sub)
+            if base in used_names or self._name_taken(base, src):
+                used_names[base] = used_names.get(base, 0) + 1
+                base = '%s-%s' % (base, dsc_number(src))
+            used_names.setdefault(base, 1)
+            dest = os.path.join(self.dest_dir, base + '.' + self.ext)
+            offset = self.shot_tz if self.shot_tz is not None else rec_off
+            self.frames.append(Frame(src, os.path.getsize(src), False, dest, dt,
+                                     date_delta=date_delta, offset=offset))
+
+    def _name_taken(self, base, src):
+        """True if base+ext already exists in dest_dir as a different file than src."""
+        cand = os.path.join(self.dest_dir, base + '.' + self.ext)
+        return os.path.exists(cand) and os.path.abspath(cand) != os.path.abspath(src)
+
     def _date_delta(self, src, rec_off):
         """Total wall-clock shift for a frame: zone_delta (from shot_tz) + time_shift.
 
@@ -1101,6 +1157,11 @@ class Haul:
         if self.rewrite:
             print('Rewrite: %s   Extension: .%s' % (self.dest_dir, self.ext))
             print('Files: %d (%d Purple preserved)' % (len(self.frames), self.featured))
+        elif self.local:
+            print('Local: %s   Extension: .%s' % (self.dest_dir, self.ext))
+            print('Files: %d (%d to rename, %d already named%s)'
+                  % (len(self.frames), len(self.to_copy), len(self.to_skip),
+                     (', %d CONFLICT' % len(self.conflicts)) if self.conflicts else ''))
         else:
             print('Card: %s   Extension: .%s   Filter: %s'
                   % (self.card, self.ext, self.filt))
@@ -1152,6 +1213,33 @@ class Haul:
             # run mid-copy - so the error message starts on its own line.
             progress.finish()
         return progress
+
+    def relocate(self):
+        """--local: move each to-rename frame to its computed dest. Returns the count.
+
+        No correction -> atomic os.rename (no temp, no byte movement; an interrupted
+        rename leaves the original in place, never a partial). Correction set ->
+        copy-patch-replace via copy_file (patched .partial, fsync, atomic rename over a
+        not-yet-existing dest), then remove the original - the one planned byte exception,
+        crash-safe like card mode. scan_local already gave every camera file a dest that
+        does not exist on disk (collisions were suffixed there), so this never overwrites.
+        An ExifPatchError propagates (aborts the run, caught in main); a per-file OSError
+        is reported and skipped.
+        """
+        renamed = 0
+        for f in self.to_copy:
+            try:
+                if f.date_delta or self.shot_tz is not None:
+                    copy_file(f.src, f.dest, date_delta=f.date_delta,
+                              target_offset=self.shot_tz)
+                    os.remove(f.src)
+                else:
+                    os.rename(f.src, f.dest)
+                renamed += 1
+            except OSError as e:
+                self.errors.append('%s: rename failed (%s)'
+                                   % (os.path.basename(f.src), e))
+        return renamed
 
     def fields_for(self, frame):
         """The sidecar properties this frame should carry, given config + template.
@@ -1264,6 +1352,8 @@ class Haul:
 
         if self.rewrite:
             return self.run_rewrite()
+        if self.local:
+            return self.run_local()
 
         if self.dry_run:
             planned = [self.would_write(f) for f in self.frames]
@@ -1280,6 +1370,26 @@ class Haul:
               % (progress.done_files, human_bytes(progress.done_bytes),
                  fmt_eta(progress.elapsed), progress.rate_mb,
                  len(self.to_skip), written, purple))
+        if self.errors:
+            print('  %d error(s):' % len(self.errors))
+            for e in self.errors:
+                print('    ! ' + e)
+        return self._exit_code()
+
+    def run_local(self):
+        """Rename-in-place ingest: no card, no copy. Renames camera-named files, then
+        writes sidecars (create-if-absent, like card mode - never clobbers an edited one).
+        """
+        if self.dry_run:
+            wcount = sum(1 for f in self.frames if self.would_write(f) is not None)
+            print('Dry run: would rename %d, write %d sidecars. Nothing changed.'
+                  % (len(self.to_copy), wcount))
+            return self._exit_code()
+
+        renamed = self.relocate()
+        written, _purple = self.write_metadata()
+        print('Done: renamed %d, skipped %d already named. Sidecars: %d written.'
+              % (renamed, len(self.to_skip), written))
         if self.errors:
             print('  %d error(s):' % len(self.errors))
             for e in self.errors:
@@ -1339,6 +1449,7 @@ def build_parser():
             '  photohaul --locked           # only the featured (locked) frames\n'
             '  photohaul --init             # scaffold photohaul.json (blank, or seeded by --profile)\n'
             '  photohaul --rewrite          # refresh copyright/caption sidecars (no card)\n'
+            '  photohaul --local raf        # rename files you copied in by hand, in place\n'
             '  photohaul --profile personal # apply a named rights preset\n'
             '  photohaul --source /Volumes/Untitled --dest ~/Photos/game\n'
             '\n'
@@ -1410,6 +1521,9 @@ def build_parser():
                          'destination; the card is not used and nothing is copied. '
                          'Merges our fields (rights, creator, caption, IPTC) into '
                          'existing sidecars and preserves the rest, including any Purple label')
+    ap.add_argument('--local', action='store_true',
+                    help='rename camera-named files already in the destination in place '
+                         '(no card, no copy); files already timestamp-named are left alone')
     ap.add_argument('--init', action='store_true',
                     help='scaffold a %s in the destination and exit; seeded from '
                          '--profile if given, else blank' % TEMPLATE_NAME)
@@ -1432,6 +1546,14 @@ def main():
     if args.rewrite and args.filter != 'all':
         sys.exit("Error: --rewrite cannot be combined with --locked/--unlocked "
                  "(lock status isn't available without the card)")
+    if args.local:
+        if args.rewrite:
+            sys.exit("Error: --local and --rewrite cannot be combined")
+        if args.source:
+            sys.exit("Error: --local does not use a card; drop --source")
+        if args.filter != 'all':
+            sys.exit("Error: --local cannot be combined with --locked/--unlocked "
+                     "(no lock status without a card)")
 
     template = load_template(dest_dir)
     profile = args.profile or (template or {}).get('profile') or DEFAULT_PROFILE
@@ -1461,8 +1583,8 @@ def main():
         sys.exit("Error: no format given. Pass one (e.g. 'photohaul arw') or set "
                  "'format = arw' in ~/.photohaul.")
 
-    if args.rewrite:
-        # Metadata-only refresh of the destination; the card is not used.
+    if args.rewrite or args.local:
+        # No card: --rewrite refreshes metadata in place; --local renames in place.
         card = None
         if not os.path.isdir(dest_dir):
             sys.exit("Error: destination %s is not a directory" % dest_dir)
@@ -1475,7 +1597,7 @@ def main():
 
     try:
         return Haul(card=card, ext=ext, dest_dir=dest_dir, filt=args.filter,
-                    dry_run=args.dry_run, rewrite=args.rewrite,
+                    dry_run=args.dry_run, rewrite=args.rewrite, local=args.local,
                     config=config, template=template, profile=profile,
                     time_shift=time_shift, shot_tz=shot_tz,
                     shot_tz_delta=shot_tz_delta).run()

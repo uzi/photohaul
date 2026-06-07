@@ -29,7 +29,7 @@ never modified.**
 
 ## Usage
 
-    src/photohaul.py [format] [--source PATH] [--dest PATH]
+    src/photohaul.py [format] [--source PATH] [--dest PATH] [--local]
                      [--locked | --unlocked | --all]
                      [--dry-run] [--rewrite] [--init] [--profile NAME]
 
@@ -219,6 +219,27 @@ label is kept as-is**; because lock status is only known from the card, rewrite
 never adds or removes a label. An existing sidecar that can't be parsed is
 reported and left untouched, never overwritten. `--rewrite` cannot be combined
 with `--locked`/`--unlocked`.
+
+## `--local` — rename files already in a folder
+
+For the "I copied a few frames off the card by hand" workflow (e.g. an X100VI or
+Ricoh GR), `photohaul --local raf` renames camera-named files **already in the
+destination** to the timestamp name, **in place** — no card, no copy:
+
+```
+$ photohaul --local raf            # operates on the current folder (or --dest)
+DSCF1234.RAF  ->  20260501-123456_708.raf
+```
+
+Files whose names already match the timestamp pattern are left untouched, so it's
+safe to re-run after dropping in more photos — only the new ones are renamed.
+A new photo whose timestamp collides with an existing one is kept under a
+`…-<number>` suffix (the existing file is never overwritten). Sidecars are written
+create-if-absent, exactly as in card mode (rights from `~/.photohaul`, caption/IPTC
+from a `photohaul.json` if present). A capture-time correction (`time_shift` /
+`shot_tz`) is honored, applied to the renamed file via a crash-safe
+copy-patch-replace. `--local` cannot be combined with `--rewrite`, `--source`, or
+`--locked`/`--unlocked`.
 
 ## Requirements
 
