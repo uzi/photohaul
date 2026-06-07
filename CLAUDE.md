@@ -8,10 +8,10 @@ off a mounted camera card into a folder, renames them to a stable
 millisecond-precise timestamp, and writes Lightroom-friendly XMP sidecars
 (color label, copyright/creator, an AP-style caption, and the structured IPTC
 fields a photo desk expects — headline, credit/source, city/state/country,
-location, usage terms, keywords). Reads Exif from Sony ARW, Nikon NEF,
-Fuji RAF, Canon CR3, and JPEG. **Zero dependencies** — stdlib only, including a
-hand-rolled Exif reader (TIFF, plus the RAF/CR3 containers) and XMP writer. No
-exiftool, no pip installs.
+location, usage terms, keywords). Reads Exif from Sony ARW, Nikon NEF, DNG
+(Adobe/Ricoh), Fuji RAF, Canon CR3, and JPEG. **Zero dependencies** — stdlib only,
+including a hand-rolled Exif reader (TIFF — covering ARW/NEF/DNG — plus standalone
+JPEG and the RAF/CR3 containers) and XMP writer. No exiftool, no pip installs.
 
 The script is run from a destination folder; it's copied to `~/bin` by hand.
 

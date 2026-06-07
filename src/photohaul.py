@@ -3,7 +3,7 @@
 # photohaul - ingest photos from a mounted camera card.
 #
 # Copies raw files off the card (format named on the CLI or via 'format=' in
-# ~/.photohaul - Sony ARW, Nikon NEF, Fuji RAF, Canon CR3, JPEG) into the current
+# ~/.photohaul - Sony ARW, Nikon NEF, Adobe/Ricoh DNG, Fuji RAF, Canon CR3, JPEG) into the current
 # folder, renaming each to a stable YYYYMMDD-hhmmss_mmm.ext name derived from Exif
 # (millisecond timestamp = unique key, so names are identical no matter which subset
 # is copied -> safe partial/repeat runs).
@@ -38,7 +38,7 @@ IS_TTY = sys.stdout.isatty()
 # ---------------------------------------------------------------------------
 # Exif reader (stdlib only) - pulls the capture timestamp (DateTimeOriginal +
 # SubSecTimeOriginal) and recorded UTC offset (OffsetTimeOriginal) from TIFF raws
-# (ARW/NEF), Fuji RAF, and Canon CR3. The same header-only IFD walk also backs the
+# (ARW/NEF/DNG), standalone JPEG, Fuji RAF, and Canon CR3. The same header-only IFD walk backs the
 # in-place date/offset patcher (shift_exif_in_place), which reuses read_ifd to find
 # each field's file offset and overwrites it at the identical byte length.
 # ---------------------------------------------------------------------------
@@ -60,8 +60,9 @@ CR3_BRAND         = b'crx '   # ftyp major brand identifying a Canon CR3 (ISO-BM
 def _exif_tiff_base(f):
     """File offset of the Exif TIFF header.
 
-    0 for a TIFF-at-start file (ARW/NEF, JPEG-less TIFF). Container formats keep
-    their Exif elsewhere:
+    0 for a TIFF-at-start file (ARW/NEF/DNG - all plain TIFF containers). Other
+    formats keep their Exif elsewhere:
+      - standalone JPEG: an APP1/Exif segment (walk markers from the SOI at 0).
       - Fuji RAF: an embedded JPEG (follow JpgImageOffset to its APP1/Exif).
       - Canon CR3: an ISO-BMFF box tree (moov/uuid/CMT2 is a standalone TIFF).
     """
@@ -70,27 +71,40 @@ def _exif_tiff_base(f):
         return _raf_exif_base(f)
     if head[4:8] == b'ftyp' and head[8:12] == CR3_BRAND:
         return _cr3_exif_base(f)
+    if head[:2] == b'\xff\xd8':                        # standalone JPEG: SOI at offset 0
+        return _jpeg_exif_base(f, 0, 'JPEG')
     return 0
 
 
-def _raf_exif_base(f):
-    """Fuji RAF: walk the header's embedded JPEG to the TIFF header in its APP1/Exif."""
-    f.seek(RAF_JPEG_OFFSET)
-    (jpg_off,) = struct.unpack('>I', f.read(4))
+def _jpeg_exif_base(f, jpg_off, label):
+    """Walk a JPEG (SOI at jpg_off) to the TIFF header inside its APP1/Exif segment.
+
+    Shared by a standalone JPEG (jpg_off=0) and Fuji RAF's embedded JPEG; `label`
+    tags the errors with the container kind. APP1/Exif precedes the entropy data, so
+    the simple marker walk (which assumes every segment carries a 2-byte length) never
+    reaches the length-less RSTn/SOS markers.
+    """
     f.seek(jpg_off)
     if f.read(2) != b'\xff\xd8':                       # JPEG SOI
-        raise ValueError('RAF: no embedded JPEG')
+        raise ValueError('%s: no JPEG SOI' % label)
     while True:
         marker = f.read(2)
         if len(marker) < 2 or marker[0] != 0xFF or marker == b'\xff\xd9':
-            raise ValueError('RAF: no Exif in embedded JPEG')
+            raise ValueError('%s: no Exif in JPEG' % label)
         (seglen,) = struct.unpack('>H', f.read(2))
         if seglen < 2:                                 # length includes its own 2 bytes;
-            raise ValueError('RAF: bad JPEG segment length')   # < 2 would seek backward
+            raise ValueError('%s: bad JPEG segment length' % label)   # < 2 seeks backward
         seg_start = f.tell()
         if marker == b'\xff\xe1' and f.read(6) == b'Exif\x00\x00':
             return f.tell()                            # TIFF header begins here
         f.seek(seg_start + seglen - 2)                 # skip to next marker (incl. XMP APP1)
+
+
+def _raf_exif_base(f):
+    """Fuji RAF: follow JpgImageOffset to the embedded JPEG, then to its APP1/Exif."""
+    f.seek(RAF_JPEG_OFFSET)
+    (jpg_off,) = struct.unpack('>I', f.read(4))
+    return _jpeg_exif_base(f, jpg_off, 'RAF')
 
 
 def _cr3_exif_base(f):
@@ -181,7 +195,7 @@ def _exif_ifds(f):
     IFD0 itself (CR3 CMT2 carries the date tags directly). Raises ValueError if the
     header is not a TIFF/Exif block or no Exif IFD is found.
     """
-    base = _exif_tiff_base(f)                       # 0 for TIFF (ARW/NEF); nonzero for RAF/CR3
+    base = _exif_tiff_base(f)                       # 0 for TIFF (ARW/NEF/DNG); nonzero for JPEG/RAF/CR3
     f.seek(base)
     head = f.read(8)
     if head[:2] == b'II':
@@ -1463,7 +1477,7 @@ def build_parser():
         epilog=(
             'examples:\n'
             '  photohaul                    # use format= from ~/.photohaul\n'
-            '  photohaul [format]           # or name it: arw Sony, cr3 Canon, nef Nikon, raf Fuji, jpg\n'
+            '  photohaul [format]           # name it: arw Sony, cr3 Canon, nef Nikon, raf Fuji, dng, jpg\n'
             '  photohaul --dry-run          # show what would happen, touch nothing\n'
             '  photohaul --locked           # only the featured (locked) frames\n'
             '  photohaul --init             # scaffold photohaul.json (blank, or seeded by --profile)\n'
@@ -1510,8 +1524,8 @@ def build_parser():
             '  makes new names (duplicates), not updates. --rewrite ignores both.\n'
             '\n'
             'notes:\n'
-            '  - Exif is read natively: TIFF raws (ARW, NEF) and JPEG directly, Fuji\n'
-            '    RAF from its embedded JPEG, Canon CR3 from its MP4-style moov box.\n'
+            '  - Exif is read natively: TIFF raws (ARW, NEF, DNG) and JPEG directly,\n'
+            '    Fuji RAF from its embedded JPEG, Canon CR3 from its MP4-style moov box.\n'
             '  - The card is read-only here; it is never written to or modified.\n'
             '  - A same-named file of matching size is skipped; one of different size\n'
             '    is reported as a conflict and never overwritten.\n'
@@ -1522,7 +1536,7 @@ def build_parser():
             '    copied. A Purple label already in a sidecar is kept; it is never added\n'
             '    or removed (lock status is unknown without the card).'))
     ap.add_argument('extension', nargs='?', default=None, metavar='format',
-                    help="raw/jpeg format to ingest (arw, cr3, nef, raf, jpg); overrides "
+                    help="raw/jpeg format to ingest (arw, cr3, nef, raf, dng, jpg); overrides "
                          "'format' in ~/.photohaul. No built-in default.")
     ap.add_argument('--source', help='card root (default: auto-detect under /Volumes)')
     ap.add_argument('--dest', default='.', help='destination dir (default: cwd)')

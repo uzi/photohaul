@@ -14,7 +14,8 @@ wins when both are present; there is no built-in default, so with neither set
 photohaul reports an error rather than guessing. photohaul reads Exif natively
 (no exiftool) from each of:
 
-- **ARW** (Sony) and **NEF** (Nikon) — TIFF at byte zero.
+- **ARW** (Sony), **NEF** (Nikon), and **DNG** (Adobe/Ricoh) — TIFF at byte zero.
+- **JPG** (any camera) — Exif in the APP1 segment, read directly.
 - **RAF** (Fuji) — Exif lives in an embedded JPEG, read transparently.
 - **CR3** (Canon) — an MP4-style container; the Exif is pulled from its `moov`
   metadata box.
