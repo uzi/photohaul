@@ -88,6 +88,7 @@ capture-time correction, EXIF). Errors if combined with `--rewrite`, `--source`,
   dir verifies names, sidecars, unlocked copies, and that an immediate re-run
   skips everything. Build a small fake card (`DCIM/<dir>/*.ARW`, `chflags uchg`
   to simulate a lock) with `--source` when a controlled fixture is easier.
+- There are samples in the samples/ folder of various image types for testing, but don't check them in
 
 ## Map of the source
 `src/photohaul.py`, top to bottom: Exif reader → naming helpers → card discovery

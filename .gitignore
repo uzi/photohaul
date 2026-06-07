@@ -17,6 +17,9 @@
 *.mp4
 *.partial
 
+# Samples folder
+samples/
+
 # Python
 __pycache__/
 *.py[cod]
