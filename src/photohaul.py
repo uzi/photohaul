@@ -672,7 +672,7 @@ def build_caption(template, date_str, config):
 
 
 # ---------------------------------------------------------------------------
-# XMP sidecar (build fresh or merge into existing; option B)
+# XMP sidecar (build fresh or merge into existing)
 # ---------------------------------------------------------------------------
 
 XMP_NS = {
@@ -1161,7 +1161,7 @@ class Haul:
     def classify(self):
         """Split planned frames into copy / skip (already present) / conflict."""
         for f in self.frames:
-            if not os.path.exists(f.dest):
+            if not os.path.isfile(f.dest):
                 self.to_copy.append(f)
             elif os.path.getsize(f.dest) == f.size:
                 self.to_skip.append(f)
