@@ -902,6 +902,13 @@ def copy_file(src, dest, on_chunk=None, date_delta=timedelta(0), target_offset=N
         except ExifPatchError:
             os.remove(partial)
             raise
+    # classify() planned against a non-existent dest, but os.rename would still silently
+    # clobber anything that raced into the path since. Re-check and abort so the "never
+    # overwrite" invariant holds (a tiny check->rename window remains, but a truly atomic
+    # no-clobber isn't portable - os.link fails on exFAT destinations).
+    if os.path.exists(dest):
+        os.remove(partial)
+        raise OSError('destination appeared after planning, not overwriting')
     os.rename(partial, dest)
     # Belt-and-suspenders: ensure the copy is unlocked and writable.
     try:
@@ -1018,6 +1025,7 @@ class Haul:
     to_copy: list = field(default_factory=list)
     to_skip: list = field(default_factory=list)
     conflicts: list = field(default_factory=list)
+    placed: list = field(default_factory=list)      # frames whose dest we copied/renamed
     _iptc: dict = field(default=None, init=False, repr=False)   # cached folder-constant fields
 
     # --- planning ------------------------------------------------------------
@@ -1051,10 +1059,16 @@ class Haul:
                 continue
             # Correct the wall-clock time before naming so the dest name, caption,
             # and {year} all derive from the corrected instant. A shot_tz with no
-            # recorded offset to derive from is a hard error (aborts the run).
-            date_delta = self._date_delta(src, rec_off)
-            dt = shift_exif_datetime(dt, date_delta)
-            base = base_name(dt, sub)
+            # recorded offset to derive from is a hard error (ExifPatchError aborts the
+            # run); a malformed date/offset is a per-file skip, not a crashed scan.
+            try:
+                date_delta = self._date_delta(src, rec_off)
+                dt = shift_exif_datetime(dt, date_delta)
+                base = base_name(dt, sub)
+            except ValueError as e:
+                self.errors.append('%s: bad capture time (%s)'
+                                   % (os.path.basename(src), e))
+                continue
             if base in used_names:
                 used_names[base] += 1
                 base = '%s-%s' % (base, dsc_number(src))
@@ -1079,6 +1093,7 @@ class Haul:
             dest = os.path.join(self.dest_dir, name)
             try:
                 dt, _sub, off = read_exif_datetime(dest)   # dest already carries corrected offset
+                datetime.strptime(dt, _DATE_FMT)           # must parse - feeds caption/DateCreated
             except (ValueError, OSError) as e:
                 self.errors.append('%s: cannot read Exif (%s)' % (name, e))
                 continue
@@ -1119,15 +1134,27 @@ class Haul:
             if already:
                 # Keep the existing (already-corrected-or-original) name and time as-is;
                 # re-patching would double-correct, and the file isn't moved or unlocked.
+                # Still validate the date parses - it feeds the caption/DateCreated later.
+                try:
+                    datetime.strptime(dt, _DATE_FMT)
+                except ValueError as e:
+                    self.errors.append('%s: bad capture time (%s)' % (name, e))
+                    continue
                 self.frames.append(Frame(src, st.st_size, False, src, dt,
                                          date_delta=timedelta(0), offset=rec_off))
                 continue
             locked = is_locked(st)
             if locked:
                 self.featured += 1
-            date_delta = self._date_delta(src, rec_off)
-            dt = shift_exif_datetime(dt, date_delta)
-            base = base_name(dt, sub)
+            # ExifPatchError (shot_tz with no recorded offset) aborts the run; a malformed
+            # date/offset is a per-file skip, not a crashed scan.
+            try:
+                date_delta = self._date_delta(src, rec_off)
+                dt = shift_exif_datetime(dt, date_delta)
+                base = base_name(dt, sub)
+            except ValueError as e:
+                self.errors.append('%s: bad capture time (%s)' % (name, e))
+                continue
             if base in used_names or self._name_taken(base, src):
                 used_names[base] = used_names.get(base, 0) + 1
                 base = '%s-%s' % (base, dsc_number(src))
@@ -1229,6 +1256,7 @@ class Haul:
                     self.errors.append('%s: copy failed (%s)'
                                        % (os.path.basename(f.dest), e))
                     continue
+                self.placed.append(f)
                 progress.file_done()
         finally:
             # Always terminate the progress line - even if an ExifPatchError aborts the
@@ -1262,8 +1290,13 @@ class Haul:
                     copy_file(f.src, f.dest, date_delta=f.date_delta,
                               target_offset=self.shot_tz)
                     os.remove(f.src)
+                elif os.path.exists(f.dest):
+                    # scan_local's _name_taken cleared this dest at plan time; guard the
+                    # plan->rename window so os.rename can't silently clobber a late arrival.
+                    raise OSError('destination appeared after planning, not overwriting')
                 else:
                     os.rename(f.src, f.dest)
+                self.placed.append(f)
                 renamed += 1
             except OSError as e:
                 self.errors.append('%s: rename failed (%s)'
@@ -1348,6 +1381,8 @@ class Haul:
 
     def would_write(self, frame):
         """For a frame, whether a sidecar would be written and if it's a Purple one."""
+        if frame in self.conflicts:
+            return None   # conflict dest is left untouched, sidecar included
         fields = self.fields_for(frame)
         if not any(fields.values()):
             return None
@@ -1357,11 +1392,21 @@ class Haul:
         return frame.locked if self.rewrite else bool(fields['label'])
 
     def write_metadata(self):
-        """Write sidecars (create-if-absent, or merge under --rewrite). Returns counts."""
+        """Write sidecars (create-if-absent, or merge under --rewrite). Returns counts.
+
+        Only files we placed (copied/renamed) or verified-present (to_skip) get a sidecar.
+        That excludes conflicts and copy failures, whose dest holds a file we did not write
+        - we never attach our metadata to a foreign file. --rewrite owns every dest it scans.
+        """
         written = purple = 0
-        for f in self.frames:
+        if self.rewrite:
+            targets = self.frames
+        else:
+            ours = {id(f) for f in self.to_skip} | {id(f) for f in self.placed}
+            targets = [f for f in self.frames if id(f) in ours]
+        for f in targets:
             if not os.path.exists(f.dest):
-                continue   # copy failed earlier
+                continue   # belt-and-suspenders; placed/to_skip dests exist
             try:
                 if write_sidecar(f.sidecar, self.fields_for(f), merge=self.rewrite):
                     written += 1
