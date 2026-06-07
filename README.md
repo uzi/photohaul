@@ -238,8 +238,9 @@ A new photo whose timestamp collides with an existing one is kept under a
 create-if-absent, exactly as in card mode (rights from `~/.photohaul`, caption/IPTC
 from a `photohaul.json` if present). A capture-time correction (`time_shift` /
 `shot_tz`) is honored, applied to the renamed file via a crash-safe
-copy-patch-replace. `--local` cannot be combined with `--rewrite`, `--source`, or
-`--locked`/`--unlocked`.
+copy-patch-replace. The in-camera **protect bit survives a hand-copy off the card**,
+so a locked frame is unlocked in place and Purple-labelled, just as in card mode.
+`--local` cannot be combined with `--rewrite`, `--source`, or `--locked`/`--unlocked`.
 
 ## Requirements
 

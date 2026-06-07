@@ -1082,7 +1082,10 @@ class Haul:
         but still scanned so its sidecar gets create-if-absent attention; a camera-named
         file gets a computed timestamp dest. Collisions resolve to the deterministic
         -dscnumber suffix, checked against both earlier frames and files already on disk,
-        so a new frame never lands on an existing name. No lock bit (no card).
+        so a new frame never lands on an existing name. The in-camera protect bit survives
+        a hand-copy off the card, so a camera-named file is checked for it (like card mode):
+        a locked frame is marked Purple and unlocked in place during relocate. Already-named
+        files are left strictly alone (their lock bit too), preserving re-run idempotency.
         """
         suffix = '.' + self.ext.lower()
         names = sorted(n for n in os.listdir(self.dest_dir)
@@ -1094,16 +1097,20 @@ class Haul:
             stem = os.path.splitext(name)[0]
             already = bool(_STAMP_RE.match(stem))
             try:
+                st = os.stat(src)
                 dt, sub, rec_off = read_exif_datetime(src)
             except (ValueError, OSError) as e:
                 self.errors.append('%s: cannot read Exif (%s)' % (name, e))
                 continue
             if already:
                 # Keep the existing (already-corrected-or-original) name and time as-is;
-                # re-patching would double-correct, and the file isn't moved.
-                self.frames.append(Frame(src, os.path.getsize(src), False, src, dt,
+                # re-patching would double-correct, and the file isn't moved or unlocked.
+                self.frames.append(Frame(src, st.st_size, False, src, dt,
                                          date_delta=timedelta(0), offset=rec_off))
                 continue
+            locked = is_locked(st)
+            if locked:
+                self.featured += 1
             date_delta = self._date_delta(src, rec_off)
             dt = shift_exif_datetime(dt, date_delta)
             base = base_name(dt, sub)
@@ -1113,7 +1120,7 @@ class Haul:
             used_names.setdefault(base, 1)
             dest = os.path.join(self.dest_dir, base + '.' + self.ext)
             offset = self.shot_tz if self.shot_tz is not None else rec_off
-            self.frames.append(Frame(src, os.path.getsize(src), False, dest, dt,
+            self.frames.append(Frame(src, st.st_size, locked, dest, dt,
                                      date_delta=date_delta, offset=offset))
 
     def _name_taken(self, base, src):
@@ -1159,8 +1166,9 @@ class Haul:
             print('Files: %d (%d Purple preserved)' % (len(self.frames), self.featured))
         elif self.local:
             print('Local: %s   Extension: .%s' % (self.dest_dir, self.ext))
-            print('Files: %d (%d to rename, %d already named%s)'
+            print('Files: %d (%d to rename, %d already named%s%s)'
                   % (len(self.frames), len(self.to_copy), len(self.to_skip),
+                     (', %d locked' % self.featured) if self.featured else '',
                      (', %d CONFLICT' % len(self.conflicts)) if self.conflicts else ''))
         else:
             print('Card: %s   Extension: .%s   Filter: %s'
@@ -1223,12 +1231,19 @@ class Haul:
         not-yet-existing dest), then remove the original - the one planned byte exception,
         crash-safe like card mode. scan_local already gave every camera file a dest that
         does not exist on disk (collisions were suffixed there), so this never overwrites.
-        An ExifPatchError propagates (aborts the run, caught in main); a per-file OSError
-        is reported and skipped.
+        A locked (in-camera protect bit) frame is unlocked first, else the rename/remove
+        would fail with EPERM; the renamed file then carries cleared flags (the rename path)
+        or copy_file's belt-and-suspenders unlock (the correction path). An ExifPatchError
+        propagates (aborts the run, caught in main); a per-file OSError is reported and skipped.
         """
         renamed = 0
         for f in self.to_copy:
             try:
+                if f.locked:
+                    # In --local the folder is ours to modify, so clearing the protect bit
+                    # here is in-bounds (unlike the read-only card); also lets rename/remove
+                    # succeed. The Purple label is carried by f.locked into the sidecar.
+                    os.chflags(f.src, 0)
                 if f.date_delta or self.shot_tz is not None:
                     copy_file(f.src, f.dest, date_delta=f.date_delta,
                               target_offset=self.shot_tz)
@@ -1381,15 +1396,19 @@ class Haul:
         writes sidecars (create-if-absent, like card mode - never clobbers an edited one).
         """
         if self.dry_run:
-            wcount = sum(1 for f in self.frames if self.would_write(f) is not None)
-            print('Dry run: would rename %d, write %d sidecars. Nothing changed.'
-                  % (len(self.to_copy), wcount))
+            planned = [self.would_write(f) for f in self.frames]
+            wcount = sum(1 for p in planned if p is not None)
+            pcount = sum(1 for p in planned if p)
+            print('Dry run: would rename %d (%d locked->unlock), write %d sidecars '
+                  '(%d Purple). Nothing changed.'
+                  % (len(self.to_copy), self.featured, wcount, pcount))
             return self._exit_code()
 
         renamed = self.relocate()
-        written, _purple = self.write_metadata()
-        print('Done: renamed %d, skipped %d already named. Sidecars: %d written.'
-              % (renamed, len(self.to_skip), written))
+        written, purple = self.write_metadata()
+        print('Done: renamed %d (%d unlocked), skipped %d already named. '
+              'Sidecars: %d written (%d Purple).'
+              % (renamed, self.featured, len(self.to_skip), written, purple))
         if self.errors:
             print('  %d error(s):' % len(self.errors))
             for e in self.errors:

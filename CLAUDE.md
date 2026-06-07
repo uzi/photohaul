@@ -66,8 +66,12 @@ card). It errors if combined with `--locked`/`--unlocked`.
 by hand — X100VI, Ricoh GR): no card, no copy. It **renames** camera-named files in place
 to the timestamp name and writes create-if-absent sidecars; files already matching the
 timestamp pattern are left alone. Unlike `--rewrite`, it changes filenames (and, under a
-capture-time correction, EXIF). Errors if combined with `--rewrite`, `--source`, or
-`--locked`/`--unlocked`. See `docs/20260606_local_mode_plan.md`.
+capture-time correction, EXIF). The in-camera protect bit survives a hand-copy off the
+card, so a camera-named locked frame is detected, **unlocked in place** (clearing the
+`uchg` flag — in-bounds here because the folder is ours, unlike the read-only card) and
+marked Purple, exactly as card mode copies-unlocked-and-Purples. Already-named files are
+left strictly alone, lock bit included. Errors if combined with `--rewrite`, `--source`,
+or `--locked`/`--unlocked`. See `docs/20260606_local_mode_plan.md`.
 
 ## Working conventions
 - **Plans live in `docs/`** as `YYYYMMDD_<name>_plan.md`, with a `Status:` line

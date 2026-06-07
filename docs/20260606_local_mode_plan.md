@@ -39,9 +39,11 @@ field — three modes is the threshold where the enum starts paying off, but con
 touches ~8 `self.rewrite` sites for no user-visible gain.)
 
 - `--local` operates on `--dest` (default: cwd). **Source = dest.** No `find_card`.
-- Mutually exclusive with `--source`, `--rewrite`, and `--locked`/`--unlocked` (no card =
-  no in-camera protect bit; the lock/Purple workflow is inapplicable). Error on combo,
-  mirroring the existing `--rewrite` + filter guard.
+- Mutually exclusive with `--source`, `--rewrite`, and `--locked`/`--unlocked` (the
+  `--locked`/`--unlocked` *filters* select a subset off a card; there is no card to filter
+  here). Error on combo, mirroring the existing `--rewrite` + filter guard. Note the lock
+  *workflow* still applies: the in-camera protect bit survives a hand-copy off the card, so
+  a camera-named locked frame is detected, unlocked in place, and marked Purple — see below.
 - Extension still required (positional or `format=` in config), same as card mode.
 - `--dry-run` reports the planned renames + sidecars, touching nothing.
 
@@ -60,8 +62,16 @@ Split by the **idempotency key — does the stem already match the timestamp pat
   the existing `base_name(dt, sub)`; this frame is a rename candidate.
 
 This is case-independent — more robust than rawsort's uppercase/lowercase heuristic
-(which still happens to hold: timestamp names are lowercase digits). `Frame.locked` is
-always `False`; `featured` stays 0.
+(which still happens to hold: timestamp names are lowercase digits).
+
+**Lock bit (added 2026-06-07).** The in-camera protect bit (uchg/immutable) survives a
+hand-copy off the card, so a *camera-named* frame is checked with `is_locked(st)`: a locked
+one sets `Frame.locked`, bumps `featured`, and `relocate` clears its flags (`os.chflags(src, 0)`)
+before the rename/remove — without which `os.rename`/`os.remove` fail with EPERM (the original
+bug: a hard error instead of unlock+Purple). `Frame.locked` then carries the Purple label into
+the sidecar via `fields_for`, exactly as in card mode. **Already-named** frames are the one
+exception: left strictly alone (name, bytes, *and* lock bit), preserving re-run idempotency —
+in practice they were renamed by a prior photohaul run and are already unlocked + Purpled.
 
 ## Collision handling (deterministic, cross-run)
 Reuse the existing `used_names` + `dsc_number` disambiguator for within-run collisions,
