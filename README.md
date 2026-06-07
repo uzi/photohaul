@@ -2,39 +2,51 @@
 
 A fast, dependency-free CLI for ingesting photos off a camera card.
 
-Copies raw files from a mounted card into the current folder, renaming each to a
-stable, millisecond-precise name derived from its Exif capture time
+photohaul copies raw files from a mounted card into the current folder and
+renames each to a stable, millisecond-precise name from its Exif capture time
 (`YYYYMMDD-hhmmss_mmm.ext`, e.g. `20260526-140024_708.ext`). Because the name
-comes only from the frame's own metadata, re-running on the same card just skips
-what already landed.
+comes only from the frame's own metadata, re-running on the same card simply
+skips whatever already landed.
 
-Pick the format with the `format` argument (e.g. `photohaul nef`), or set a
-default `format` in `~/.photohaul` (below) and just run `photohaul`. The argument
-wins when both are present; there is no built-in default, so with neither set
-photohaul reports an error rather than guessing. photohaul reads Exif natively
-(no exiftool) from each of:
+Frames you locked (protected) in-camera are detected, copied **unlocked**, and
+tagged with a Purple color label for Lightroom via an `.xmp` sidecar. **The card
+itself is never modified.**
 
-- **ARW** (Sony), **NEF** (Nikon), and **DNG** (Adobe/Ricoh) — TIFF at byte zero.
-- **JPG** (any camera) — Exif in the APP1 segment, read directly.
-- **RAF** (Fuji) — Exif lives in an embedded JPEG, read transparently.
-- **CR3** (Canon) — an MP4-style container; the Exif is pulled from its `moov`
-  metadata box.
+## Quick start
 
-So `photohaul <format>` ingests any of them the same way — stable naming,
-byte-exact copies, and (where the camera's in-camera Protect maps to the macOS
-lock bit) Purple-labelling of protected frames.
+Run it from the folder you want the photos copied *into*:
 
-Frames locked (protected) in-camera are detected, copied unlocked, and tagged
-with a Purple color label for Lightroom via an `.xmp` sidecar. **The card is
-never modified.**
+```sh
+cd ~/Photos/some-shoot          # the destination
+photohaul arw            # copy every .ARW off the mounted card
+photohaul arw --dry-run  # ...or preview first, touching nothing
+```
+
+Set a default `format` in `~/.photohaul` (below) and you can drop the argument
+and just run `photohaul`.
+
+## Supported formats
+
+photohaul reads Exif natively — no exiftool, no dependencies:
+
+| Format | Camera | Where the Exif lives |
+|--------|--------|----------------------|
+| **ARW** / **NEF** / **DNG** | Sony / Nikon / Adobe·Ricoh | TIFF at byte zero |
+| **JPG** | any | APP1 segment, read directly |
+| **RAF** | Fuji | an embedded JPEG, read transparently |
+| **CR3** | Canon | an MP4-style container's `moov` metadata box |
+
+Pick the format with the `format` argument (e.g. `photohaul nef`) or set a
+default in `~/.photohaul`. The argument wins when both are present; there is no
+built-in default, so with neither set photohaul errors rather than guessing.
 
 ## Usage
 
-    src/photohaul.py [format] [--source PATH] [--dest PATH] [--local]
-                     [--locked | --unlocked | --all]
-                     [--dry-run] [--rewrite] [--init] [--profile NAME]
+    photohaul [format] [--source PATH] [--dest PATH] [--local]
+              [--locked | --unlocked | --all]
+              [--dry-run] [--rewrite] [--init] [--profile NAME]
 
-See `src/photohaul.py --help` for the full list of options and examples.
+See `photohaul --help` for the full list of options and examples.
 
 ## Metadata (copyright, creator, captions)
 
@@ -44,7 +56,9 @@ idempotent. (The lone exception is an opt-in capture-time correction, below, whi
 rewrites the copy's EXIF date/offset fields in place.) Lightroom reads these on
 import.
 
-**Rights** come from an optional `~/.photohaul` config file (INI). Keys in
+### Rights
+
+Rights come from an optional `~/.photohaul` config file (INI). Keys in
 `[default]` are inherited by every profile; a profile section overrides or adds.
 Missing file or field → simply not written:
 
@@ -68,13 +82,17 @@ A ready-to-edit [`example.photohaul`](example.photohaul) ships in the repo with 
 `[default]` plus sample `highschool` / `college` / `club` profiles — copy it to
 `~/.photohaul` as a starting point.
 
-**Profiles** let one camera serve multiple contexts (e.g. personal vs. work)
+### Profiles
+
+Profiles let one camera serve multiple contexts (e.g. personal vs. work)
 with different rights. The active profile is chosen by, in order: `--profile NAME`,
 then a `"profile"` key in the folder's `photohaul.json`, then `[default]`. A folder
 with no template stays on `[default]` — so personal shots never pick up the
 branded copyright. (A section-less legacy config is read as `[default]`.)
 
-**Client profiles.** A profile section may also carry the per-shoot template keys
+### Client profiles
+
+A profile section may also carry the per-shoot template keys
 below (home team, venue, city, state, conference, usage terms…) for a recurring
 client or venue. `photohaul --init --profile NAME` then **seeds** the new
 `photohaul.json` from them, so stable values aren't retyped each shoot:
@@ -93,7 +111,9 @@ This is a one-time copy at `--init`; the JSON is the source of truth thereafter
 `credit`/`format` are read from the config). Bare `--init` still seeds from
 `[default]`.
 
-**Per-shoot caption + IPTC fields** come from a `photohaul.json` in the
+### Captions & IPTC fields
+
+Per-shoot caption and IPTC fields come from a `photohaul.json` in the
 destination folder, auto-detected on ingest. Scaffold one with `photohaul --init`
 (blank, or seeded from a profile, above):
 
