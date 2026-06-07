@@ -1,0 +1,67 @@
+# example.photohaul — copy this to ~/.photohaul and edit.
+#
+# INI format (parsed with Python's configparser; no value interpolation).
+# [default] is inherited by every named profile; a profile section overrides or
+# adds keys. Choose a profile per shoot with:
+#     photohaul --profile NAME
+# or by setting the "profile" key inside a folder's photohaul.json.
+#
+# Keys come in two kinds:
+#   * rights — creator, copyright, credit, source, format. Read at COPY time and
+#     written into every .xmp sidecar.
+#   * client defaults — any photohaul.json key (homeTeam, venue, city, sport, ...).
+#     OPTIONAL; used only to SEED a new photohaul.json via:
+#         photohaul --init --profile NAME
+#     They do nothing at copy time — the folder's photohaul.json is authoritative
+#     once it exists.
+#
+# Attribution fields, disambiguated:
+#   creator = who made the photo                         -> dc:creator
+#   credit  = how to attribute it, "Photo by ..."        -> photoshop:Credit
+#   source  = who owns/licenses it (e.g. an agency)      -> photoshop:Source
+#
+# NOTE: inline comments are NOT supported — keep comments on their own lines, or
+# the "# ..." would be read as part of the value.
+
+[default]
+# {year} expands to each frame's capture year, so this never needs bumping.
+creator   = Jane Roe
+copyright = © {year} Jane Roe
+credit    = Jane Roe / yoursite.com
+source    = yoursite.com
+# Default file type to ingest when none is given on the command line.
+format    = arw
+
+# --- Recurring clients --------------------------------------------------------
+# Each section inherits everything in [default] and overrides/adds below. A
+# section can also be selected purely for its rights (the client-default keys are
+# simply ignored unless you run --init --profile NAME).
+
+# High school: the home team and gym are stable; you shoot in their town.
+[highschool]
+sport       = women's volleyball
+event       = high school volleyball match
+homeTeam    = Union High School
+homeShort   = Union
+venue       = Union High School Gymnasium
+city        = Springfield
+state       = California
+rightsUsage = Editorial and school use only. No resale without written permission.
+
+# College: a different venue/conference and stricter licensing language.
+[college]
+sport       = women's volleyball
+event       = NCAA women's volleyball match
+homeTeam    = State University
+homeShort   = State
+venue       = University Arena
+city        = Springfield
+state       = California
+conference  = Example Conference
+rightsUsage = Editorial use only. No resale, advertising, NIL, merchandise, or commercial use without written permission. Credential restrictions may apply.
+
+# Club: only the licensing is stable; team and venue change every shoot.
+[club]
+credit      = Jane Roe / Example Club Photos
+source      = Example Club Photos
+rightsUsage = Client use only; no redistribution.

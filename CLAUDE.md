@@ -36,15 +36,19 @@ The script is run from a destination folder; it's copied to `~/bin` by hand.
 - `~/.photohaul` — INI, parsed with `configparser` (`interpolation=None`).
   `[default]` is inherited by named profile sections. Holds the default `format`
   (overridden by the CLI positional; no built-in default) and **rights** (creator
-  / copyright / credit); `{year}` in copyright expands to the capture year. See
-  `docs/20260605_profiles_plan.md`.
+  / copyright / credit); `{year}` in copyright expands to the capture year. A
+  profile section may *also* carry the `photohaul.json` scaffold keys below as
+  client/venue defaults — these are inert at copy time and used only to seed
+  `--init --profile NAME`. See `docs/20260605_profiles_plan.md` and
+  `docs/20260606_client_profiles_plan.md`.
 - `photohaul.json` in the destination — the per-folder shoot scaffold:
   caption/IPTC keys (sport, event, homeTeam/awayTeam,
   homeShort/awayShort, venue, city, state, country, conference, credit, source,
   rightsUsage, assignment) plus `profile`, and the capture-time correction keys
   `time_shift` / `shot_tz`. Caption is AP-style; the per-image action sentence
-  stays a manual Lightroom pass. Scaffolded by `--init-template`. See
-  `docs/20260606_iptc_fields_plan.md`.
+  stays a manual Lightroom pass. Scaffolded by `--init` (seeded from a profile when
+  `--profile` is given; `time_shift`/`shot_tz` always blank). See
+  `docs/20260606_iptc_fields_plan.md` and `docs/20260606_client_profiles_plan.md`.
 
 ## `--rewrite` is card-free
 `--rewrite` is a destination-only metadata refresh: no card, no copying. It scans

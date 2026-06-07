@@ -482,24 +482,32 @@ def load_config(profile=None, path=CONFIG_PATH):
     """Resolve rights from ~/.photohaul (INI; [default] is inherited by profiles).
 
     profile=None (or 'default') -> the [default] keys only. A named profile is
-    merged over [default]. Missing file -> empty dict. Exits if a named profile
-    is absent. A section-less (legacy flat) file is treated as [default].
+    merged over [default]. Missing file -> empty dict (but a named profile then
+    has nothing to resolve, so that exits). Exits if a named profile is absent,
+    listing the profiles that do exist. A section-less (legacy flat) file is
+    treated as [default].
     """
     parser = configparser.ConfigParser(default_section=DEFAULT_PROFILE,
                                         interpolation=None)
+    named = bool(profile) and profile != DEFAULT_PROFILE
     try:
         with open(path, encoding='utf-8') as f:
             text = f.read()
     except FileNotFoundError:
+        if named:
+            sys.exit("Error: profile '%s' requested but no config file at %s"
+                     % (profile, path))
         return {}
     try:
         parser.read_string(text)
     except configparser.MissingSectionHeaderError:
         parser.read_string('[%s]\n%s' % (DEFAULT_PROFILE, text))
 
-    if profile and profile != DEFAULT_PROFILE:
+    if named:
         if not parser.has_section(profile):
-            sys.exit("Error: profile '%s' not found in %s" % (profile, path))
+            avail = ', '.join(parser.sections()) or '(none defined)'
+            sys.exit("Error: profile '%s' not found in %s\nAvailable profiles: %s"
+                     % (profile, path, avail))
         return dict(parser[profile])
     return dict(parser.defaults())
 
@@ -519,22 +527,31 @@ def load_template(dest_dir):
     return data
 
 
-def write_template(dest_dir):
-    """Scaffold a blank photohaul.json (caption/IPTC keys + corrections, one per line)."""
+def write_template(dest_dir, profile=None, config=None):
+    """Scaffold a photohaul.json, optionally seeded from a ~/.photohaul profile.
+
+    With `config` (the resolved [default]+profile dict from load_config) each scaffold key
+    is filled from the profile's matching value, else left blank - so bare --init still
+    seeds from [default]. configparser lower-cases option names, so each camelCase key is
+    looked up case-folded. `profile` holds the profile name; `time_shift`/`shot_tz` are
+    always blank (per-shoot capture-time corrections stay explicit, never profile state).
+    Values are JSON-escaped via json.dumps (quotes, (c), etc. survive round-trip).
+    """
     if not os.path.isdir(dest_dir):
         sys.exit("Error: destination %s is not a directory" % dest_dir)
     path = os.path.join(dest_dir, TEMPLATE_NAME)
     if os.path.exists(path):
         sys.exit("Error: %s already exists; not overwriting." % path)
-    keys = ['profile'] + TEMPLATE_KEYS + ['time_shift', 'shot_tz']
-    lines = ['{']
-    for i, key in enumerate(keys):
-        tail = ',' if i < len(keys) - 1 else ''
-        lines.append('  "%s": ""%s' % (key, tail))
-    lines.append('}')
+    config = config or {}
+    scaffold = {'profile': profile or ''}
+    for key in TEMPLATE_KEYS:
+        scaffold[key] = config.get(key.lower(), '')
+    scaffold['time_shift'] = ''
+    scaffold['shot_tz'] = ''
     with open(path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines) + '\n')
-    print('Wrote blank photohaul.json template: %s' % path)
+        f.write(json.dumps(scaffold, indent=2, ensure_ascii=False) + '\n')
+    seeded = ' (seeded from profile [%s])' % profile if profile else ''
+    print('Wrote photohaul.json template%s: %s' % (seeded, path))
 
 
 def capture_year(captured):
@@ -1320,7 +1337,7 @@ def build_parser():
             '  photohaul [format]           # or name it: arw Sony, cr3 Canon, nef Nikon, raf Fuji, jpg\n'
             '  photohaul --dry-run          # show what would happen, touch nothing\n'
             '  photohaul --locked           # only the featured (locked) frames\n'
-            '  photohaul --init-template    # scaffold a blank photohaul.json here\n'
+            '  photohaul --init             # scaffold photohaul.json (blank, or seeded by --profile)\n'
             '  photohaul --rewrite          # refresh copyright/caption sidecars (no card)\n'
             '  photohaul --profile personal # apply a named rights preset\n'
             '  photohaul --source /Volumes/Untitled --dest ~/Photos/game\n'
@@ -1336,6 +1353,9 @@ def build_parser():
             '\n'
             'profile: --profile NAME, else "profile" in photohaul.json, else [default].\n'
             '  A folder with no template stays on [default] (e.g. personal, unbranded).\n'
+            '  A section may also hold template keys below (homeTeam, venue, city, ...);\n'
+            '  "--init --profile NAME" then seeds photohaul.json from them (one-time copy,\n'
+            '  inert at copy time - the JSON is the source of truth thereafter).\n'
             '\n'
             'caption + IPTC template (photohaul.json in the destination, auto-detected):\n'
             '  keys: profile; sport, event, homeTeam, awayTeam, homeShort, awayShort,\n'
@@ -1390,8 +1410,9 @@ def build_parser():
                          'destination; the card is not used and nothing is copied. '
                          'Merges our fields (rights, creator, caption, IPTC) into '
                          'existing sidecars and preserves the rest, including any Purple label')
-    ap.add_argument('--init-template', action='store_true',
-                    help='write a blank %s into the destination and exit' % TEMPLATE_NAME)
+    ap.add_argument('--init', action='store_true',
+                    help='scaffold a %s in the destination and exit; seeded from '
+                         '--profile if given, else blank' % TEMPLATE_NAME)
     ap.add_argument('--profile',
                     help='rights profile from ~/.photohaul (overrides the template); '
                          'default falls back to the "profile" key in %s' % TEMPLATE_NAME)
@@ -1404,8 +1425,8 @@ def main():
 
     dest_dir = os.path.abspath(args.dest)
 
-    if args.init_template:
-        write_template(dest_dir)
+    if args.init:
+        write_template(dest_dir, args.profile, load_config(args.profile))
         return 0
 
     if args.rewrite and args.filter != 'all':

@@ -31,7 +31,7 @@ never modified.**
 
     src/photohaul.py [format] [--source PATH] [--dest PATH]
                      [--locked | --unlocked | --all]
-                     [--dry-run] [--rewrite] [--init-template]
+                     [--dry-run] [--rewrite] [--init] [--profile NAME]
 
 See `src/photohaul.py --help` for the full list of options and examples.
 
@@ -48,15 +48,24 @@ import.
 Missing file or field → simply not written:
 
 ```ini
+# Inline comments are not supported — keep comments on their own line, or the
+# "; ..." would be read as part of the value.
 [default]
-format    = arw                    ; default format when none is given on the CLI
-creator   = Your Name              ; -> dc:creator
-copyright = © {year} Your Name     ; -> dc:rights  ({year} = capture year)
+# format: default file type to ingest when none is given on the CLI
+format    = arw
+# creator -> dc:creator ; copyright -> dc:rights  ({year} = capture year)
+creator   = Your Name
+copyright = © {year} Your Name
 
 [work]
 copyright = © {year} Your Name / yoursite.com
-credit    = Your Name/yoursite.com ; default caption byline
+# credit -> photoshop:Credit and the default caption byline
+credit    = Your Name/yoursite.com
 ```
+
+A ready-to-edit [`example.photohaul`](example.photohaul) ships in the repo with a
+`[default]` plus sample `highschool` / `college` / `club` profiles — copy it to
+`~/.photohaul` as a starting point.
 
 **Profiles** let one camera serve multiple contexts (e.g. personal vs. work)
 with different rights. The active profile is chosen by, in order: `--profile NAME`,
@@ -64,9 +73,28 @@ then a `"profile"` key in the folder's `photohaul.json`, then `[default]`. A fol
 with no template stays on `[default]` — so personal shots never pick up the
 branded copyright. (A section-less legacy config is read as `[default]`.)
 
+**Client profiles.** A profile section may also carry the per-shoot template keys
+below (home team, venue, city, state, conference, usage terms…) for a recurring
+client or venue. `photohaul --init --profile NAME` then **seeds** the new
+`photohaul.json` from them, so stable values aren't retyped each shoot:
+
+```ini
+[highschool]
+homeTeam  = Union High School
+homeShort = Union
+venue     = Union High School Gymnasium
+city      = Springfield
+state     = California
+```
+
+This is a one-time copy at `--init`; the JSON is the source of truth thereafter
+(those template keys are inert at copy time, where only `creator`/`copyright`/
+`credit`/`format` are read from the config). Bare `--init` still seeds from
+`[default]`.
+
 **Per-shoot caption + IPTC fields** come from a `photohaul.json` in the
-destination folder, auto-detected on ingest. Scaffold a blank one with `photohaul
---init-template`:
+destination folder, auto-detected on ingest. Scaffold one with `photohaul --init`
+(blank, or seeded from a profile, above):
 
 ```json
 {
@@ -94,20 +122,40 @@ destination folder, auto-detected on ingest. Scaffold a blank one with `photohau
 Blank fields are omitted (`profile` selects the rights preset; `time_shift` /
 `shot_tz` are the capture-time correction below). From these, photohaul writes an
 AP-style caption **and** the structured IPTC fields a photo desk / SID workflow
-expects, all into the sidecar:
+expects, all into the sidecar. What goes in each key, with examples:
 
-| Field | XMP property | From |
-|-------|--------------|------|
-| Caption | `dc:description` | assembled (below) |
-| Headline | `photoshop:Headline` | `homeShort` vs. `awayShort` + `sport` |
-| Credit | `photoshop:Credit` | `credit` (→ config `credit`/`creator`) |
-| Source | `photoshop:Source` | `source` |
-| City / State / Country | `photoshop:City` / `:State` / `:Country` | as typed (full names) |
-| Location (sublocation) | `Iptc4xmpCore:Location` | `venue` |
-| Instructions | `photoshop:Instructions` | `assignment` |
-| Rights usage terms | `xmpRights:UsageTerms` | `rightsUsage` |
-| Date created | `photoshop:DateCreated` | per-frame, ISO 8601 + offset |
-| Keywords | `dc:subject` | sport, teams, conference |
+| `photohaul.json` key | Example value | Written to |
+|----------------------|---------------|------------|
+| `profile`     | `college` | selects the `~/.photohaul` rights preset (not written to the sidecar) |
+| `sport`       | `women's volleyball` | `photoshop:Headline` + keywords |
+| `event`       | `NCAA women's volleyball match` | caption (generic event description) |
+| `homeTeam`    | `State University Wolves` | keywords |
+| `awayTeam`    | `City College Hawks` | keywords |
+| `homeShort`   | `State` | caption (`State vs. City`), headline, keywords |
+| `awayShort`   | `City` | caption, headline, keywords |
+| `venue`       | `University Arena` | `Iptc4xmpCore:Location` (sublocation) + caption |
+| `city`        | `Springfield` | `photoshop:City` + caption |
+| `state`       | `California` | `photoshop:State` (full name; caption auto-abbreviates to `Calif.`) |
+| `country`     | `USA` | `photoshop:Country` (omitted from the caption) |
+| `conference`  | `Example Conference` | keywords |
+| `credit`      | `Jane Roe / yoursite.com` | `photoshop:Credit` + caption byline |
+| `source`      | `yoursite.com` | `photoshop:Source` |
+| `rightsUsage` | `Editorial use only. No resale or commercial use without written permission.` | `xmpRights:UsageTerms` |
+| `assignment`  | `Embargoed until 2025-10-04 06:00 PT` | `photoshop:Instructions` (Special Instructions) |
+| `time_shift`  | `+2h30m` | capture-time correction (see below) |
+| `shot_tz`     | `-04:00` | capture-time correction (see below) |
+
+Three fields are assembled, not typed directly: **Caption** (`dc:description`,
+below), **Keywords** (`dc:subject`, from `sport` + team names + `conference`), and
+**Date created** (`photoshop:DateCreated`, per frame as ISO 8601 + offset).
+
+The three attribution fields are easy to confuse: **creator** (`dc:creator`,
+from the config) is the person who made the photo; **credit** (`photoshop:Credit`)
+is how the credit line should read ("Photo by …"); **source** (`photoshop:Source`)
+is the owner/agency that holds and licenses the image. **`rightsUsage`**
+(`xmpRights:UsageTerms`) is the licensing language that travels with the file, and
+**`assignment`** (`photoshop:Instructions`) is the Special Instructions field —
+desk/assignment notes, embargoes, client-specific handling.
 
 `city`/`state`/`country` go into the structured fields as typed, so use full
 names (e.g. `state: "California"`). The **caption** abbreviates the state to AP
