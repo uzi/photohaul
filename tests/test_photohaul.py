@@ -1136,6 +1136,84 @@ class TestParser(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# main() wiring: the CLI seam - flag-conflict guards and config/template -> Haul
+# resolution. The validation exits run before any card access; the happy-path runs
+# drive a fake card end to end (load_config is stubbed - TestConfig covers it - so
+# these don't depend on the developer's real ~/.photohaul).
+# ---------------------------------------------------------------------------
+
+class TestMain(TempCase):
+    def _run(self, argv, config=None):
+        old_argv, old_lc = sys.argv, ph.load_config
+        sys.argv = ['photohaul'] + argv
+        ph.load_config = lambda profile=None, path=None: dict(config or {})
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                return ph.main()
+        finally:
+            sys.argv, ph.load_config = old_argv, old_lc
+
+    def _card(self, name='M.ARW', **tiff):
+        card = os.path.join(self.tmp, 'card')
+        self.write(os.path.join('card', 'DCIM', '100MSDCF', name), build_tiff(**tiff))
+        return card
+
+    # --- flag-conflict guards (must abort before touching a card) -------------
+
+    def test_local_and_rewrite_conflict(self):
+        with self.assertRaises(SystemExit):
+            self._run(['arw', '--local', '--rewrite'])
+
+    def test_local_and_source_conflict(self):
+        with self.assertRaises(SystemExit):
+            self._run(['arw', '--local', '--source', self.tmp])
+
+    def test_local_and_filter_conflict(self):
+        with self.assertRaises(SystemExit):
+            self._run(['arw', '--local', '--locked'])
+
+    def test_rewrite_and_filter_conflict(self):
+        with self.assertRaises(SystemExit):
+            self._run(['arw', '--rewrite', '--locked'])
+
+    def test_no_format_anywhere_exits(self):
+        with self.assertRaises(SystemExit):
+            self._run([], config={})        # no positional, no 'format' in config
+
+    # --- config/template resolution through to the copy ----------------------
+
+    def test_format_from_config_when_no_positional(self):
+        card = self._card()
+        dest = os.path.join(self.tmp, 'dest'); os.makedirs(dest)
+        rc = self._run(['--source', card, '--dest', dest], config={'format': 'arw'})
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(os.path.join(dest, '20260526-140024_708.arw')))
+
+    def test_template_time_shift_reaches_the_copy(self):
+        # The cognitively important wiring: a photohaul.json time_shift must drive both
+        # the dest name and the patched EXIF - proving main() reads it and threads it
+        # through to Haul, not just that Haul honors a time_shift it's handed.
+        card = self._card()
+        dest = os.path.join(self.tmp, 'dest'); os.makedirs(dest)
+        with open(os.path.join(dest, ph.TEMPLATE_NAME), 'w') as f:
+            f.write('{"time_shift": "+1h"}')
+        rc = self._run(['arw', '--source', card, '--dest', dest],
+                       config={'creator': 'Tester'})
+        self.assertEqual(rc, 0)
+        arw = os.path.join(dest, '20260526-150024_708.arw')        # shifted +1h
+        self.assertTrue(os.path.exists(arw))
+        self.assertEqual(ph.read_exif_datetime(arw)[0], '2026:05:26 15:00:24')
+
+    def test_bad_time_shift_in_template_exits(self):
+        card = self._card()
+        dest = os.path.join(self.tmp, 'dest'); os.makedirs(dest)
+        with open(os.path.join(dest, ph.TEMPLATE_NAME), 'w') as f:
+            f.write('{"time_shift": "soon"}')
+        with self.assertRaises(SystemExit):
+            self._run(['arw', '--source', card, '--dest', dest])
+
+
+# ---------------------------------------------------------------------------
 # Real-format fidelity (only when samples/ is present; nothing committed)
 # ---------------------------------------------------------------------------
 
