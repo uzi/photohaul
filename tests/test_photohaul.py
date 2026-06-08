@@ -813,6 +813,112 @@ class TestHaulLocalMode(TempCase):
 
 
 # ---------------------------------------------------------------------------
+# Voice-memo WAV sidecars (audio notes ride along with their photo, by name)
+# ---------------------------------------------------------------------------
+
+class TestAudioNotes(TempCase):
+    WAV = b'RIFF' + b'\x00' * 60     # opaque to photohaul; copied/renamed byte-for-byte
+
+    def test_audio_sibling_lookup(self):
+        arw = self.write(os.path.join('d', 'A1_02696.ARW'), build_tiff())
+        self.assertIsNone(ph.audio_sibling(arw))            # no WAV yet
+        wav = self.write(os.path.join('d', 'A1_02696.WAV'), self.WAV)
+        self.assertEqual(ph.audio_sibling(arw), wav)
+
+    # --- card mode -----------------------------------------------------------
+
+    def _card(self, stem='A1_02696', wav=True, **tiff):
+        self.write(os.path.join('card', 'DCIM', '100MSDCF', stem + '.ARW'), build_tiff(**tiff))
+        if wav:
+            self.write(os.path.join('card', 'DCIM', '100MSDCF', stem + '.WAV'), self.WAV)
+        return os.path.join(self.tmp, 'card')
+
+    def _haul(self, card, dest, **kw):
+        return ph.Haul(card=card, ext='arw', dest_dir=dest, filt='all', dry_run=False,
+                       rewrite=False, config=CONFIG, template=None, profile='default', **kw)
+
+    def test_wav_copied_to_photo_name_no_sidecar(self):
+        card = self._card()
+        dest = os.path.join(self.tmp, 'dest'); os.makedirs(dest)
+        h = self._haul(card, dest)
+        silent(h.run)
+        wav = os.path.join(dest, '20260526-140024_708.wav')
+        self.assertEqual(rb(wav), self.WAV)                              # byte-exact, matched name
+        self.assertTrue(os.path.exists(os.path.join(dest, '20260526-140024_708.arw')))
+        self.assertFalse(os.path.exists(os.path.join(dest, '20260526-140024_708.wav.xmp')))
+        self.assertEqual(len(h.audio_placed), 1)
+
+    def test_wav_idempotent_rerun(self):
+        card = self._card()
+        dest = os.path.join(self.tmp, 'dest'); os.makedirs(dest)
+        silent(self._haul(card, dest).run)
+        h2 = self._haul(card, dest)
+        silent(h2.run)
+        self.assertEqual(len(h2.audio_to_copy), 0)
+        self.assertEqual(len(h2.audio_to_skip), 1)
+
+    def test_wav_follows_photo_collision_suffix(self):
+        # A different file occupies the bare photo name, so the photo (and its WAV) take
+        # the -dscnumber suffix; the pair stays together.
+        card = self._card()
+        dest = os.path.join(self.tmp, 'dest'); os.makedirs(dest)
+        self.write(os.path.join('dest', '20260526-140024_708.arw'), b'different bytes')
+        silent(self._haul(card, dest).run)
+        self.assertTrue(os.path.exists(os.path.join(dest, '20260526-140024_708-02696.arw')))
+        self.assertEqual(rb(os.path.join(dest, '20260526-140024_708-02696.wav')), self.WAV)
+
+    def test_wav_conflict_not_overwritten(self):
+        card = self._card()
+        dest = os.path.join(self.tmp, 'dest'); os.makedirs(dest)
+        self.write(os.path.join('dest', '20260526-140024_708.wav'), b'someone elses audio')
+        h = self._haul(card, dest)
+        rc = silent(h.run)
+        self.assertEqual(rb(os.path.join(dest, '20260526-140024_708.wav')),
+                         b'someone elses audio')                        # untouched
+        self.assertEqual(len(h.audio_conflicts), 1)
+        self.assertEqual(rc, 1)                                         # conflict -> non-zero
+
+    def test_no_wav_means_no_audio_activity(self):
+        card = self._card(wav=False)
+        dest = os.path.join(self.tmp, 'dest'); os.makedirs(dest)
+        h = self._haul(card, dest)
+        silent(h.run)
+        self.assertEqual(h.audio_to_copy, [])
+        self.assertEqual(h.audio_placed, [])
+
+    def test_dry_run_skips_wav(self):
+        card = self._card()
+        dest = os.path.join(self.tmp, 'dest'); os.makedirs(dest)
+        h = ph.Haul(card=card, ext='arw', dest_dir=dest, filt='all', dry_run=True,
+                    rewrite=False, config=CONFIG, template=None, profile='default')
+        silent(h.run)
+        self.assertEqual(os.listdir(dest), [])
+
+    # --- local mode ----------------------------------------------------------
+
+    def _local(self, dest, **kw):
+        return ph.Haul(card=None, ext='arw', dest_dir=dest, filt='all', dry_run=False,
+                       rewrite=False, config=CONFIG, template=None, profile='default',
+                       local=True, **kw)
+
+    def test_local_renames_wav_with_photo(self):
+        dest = self.tmp
+        self.write('A1_02696.ARW', build_tiff())
+        self.write('A1_02696.WAV', self.WAV)
+        silent(self._local(dest).run)
+        self.assertFalse(os.path.exists(os.path.join(dest, 'A1_02696.WAV')))      # moved
+        self.assertEqual(rb(os.path.join(dest, '20260526-140024_708.wav')), self.WAV)
+
+    def test_local_time_shift_wav_follows_name_unpatched(self):
+        # The WAV has no EXIF to correct: it just follows the photo's shifted name, byte-exact.
+        dest = self.tmp
+        self.write('A1_02696.ARW', build_tiff())
+        self.write('A1_02696.WAV', self.WAV)
+        silent(self._local(dest, time_shift=timedelta(hours=1)).run)
+        self.assertEqual(rb(os.path.join(dest, '20260526-150024_708.wav')), self.WAV)
+
+
+# ---------------------------------------------------------------------------
 # Lock -> unlock -> Purple (macOS UF_IMMUTABLE; skipped elsewhere)
 # ---------------------------------------------------------------------------
 

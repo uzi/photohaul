@@ -9,8 +9,9 @@ comes only from the frame's own metadata, re-running on the same card simply
 skips whatever already landed.
 
 Frames you locked (protected) in-camera are detected, copied **unlocked**, and
-tagged with a Purple color label for Lightroom via an `.xmp` sidecar. **The card
-itself is never modified.**
+tagged with a Purple color label for Lightroom via an `.xmp` sidecar. In-camera
+**voice memos** (the sidecar `.WAV` Sony and Nikon record next to a frame) ride
+along, renamed to match their photo. **The card itself is never modified.**
 
 ## Quick start
 
@@ -272,6 +273,20 @@ create-if-absent sidecars (rights from `~/.photohaul`, caption/IPTC from a
 honored, applied to the renamed file via a crash-safe copy-patch-replace. The in-camera **protect bit survives a hand-copy off the card**,
 so a locked frame is unlocked in place and Purple-labelled, just as in card mode.
 `--local` cannot be combined with `--rewrite`, `--source`, or `--locked`/`--unlocked`.
+
+## Audio notes (voice memos)
+
+Some bodies (Sony A1, various Nikons) record a spoken note as a sidecar `.WAV`
+sharing the photo's basename — `A1_02696.ARW` + `A1_02696.WAV`. photohaul detects
+that pairing and brings the WAV along with its photo, renamed to the same stable
+timestamp (`20260526-140024_708.arw` + `20260526-140024_708.wav`) so the two stay
+together in the destination.
+
+The WAV is copied byte-for-byte (card mode) or renamed in place (`--local`); it
+carries no Exif, so a `time_shift`/`shot_tz` correction only changes its *name*,
+never its bytes, and it gets no `.xmp` sidecar of its own. Like the raw, it's
+idempotent (a same-name, same-size WAV is skipped) and never overwrites a
+different file at its name. `--rewrite` is metadata-only and ignores audio notes.
 
 ## Requirements
 

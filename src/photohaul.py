@@ -419,6 +419,24 @@ def base_name(dt_str, subsec):
     return stamp
 
 
+AUDIO_EXT = 'wav'     # in-camera voice memos: a sidecar WAV sharing the photo's basename
+
+
+def audio_sibling(photo_path):
+    """Path to a voice-memo WAV recorded next to `photo_path` (same stem), or None.
+
+    Sony (verified on the A1) and Nikon write an in-camera audio note as a sidecar WAV
+    sharing the photo's basename - A1_02696.ARW + A1_02696.WAV. Format-agnostic. Checks
+    both cases for case-sensitive filesystems (cards are usually case-insensitive).
+    """
+    stem = os.path.splitext(photo_path)[0]
+    for ext in ('.WAV', '.wav'):
+        cand = stem + ext
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
 def dsc_number(filename):
     """Trailing digit run from the original card name, e.g. A1_02660.ARW -> '02660'."""
     stem = os.path.splitext(os.path.basename(filename))[0]
@@ -1001,10 +1019,17 @@ class Frame:
     captured: str          # corrected Exif datetime, e.g. '2026:05:26 14:00:24'
     date_delta: timedelta = timedelta(0)   # wall-clock shift to patch into the copy
     offset: str = None     # effective UTC offset ('±HH:MM') for IPTC DateCreated, or None
+    audio_src: str = None  # sibling voice-memo WAV (same stem on the card), if any
+    audio_size: int = 0    # its byte size, for idempotency + progress totals
 
     @property
     def sidecar(self):
         return os.path.splitext(self.dest)[0] + '.xmp'
+
+    @property
+    def audio_dest(self):
+        """Where this frame's audio note lands: the photo's name with a .wav extension."""
+        return os.path.splitext(self.dest)[0] + '.' + AUDIO_EXT
 
 
 @dataclass
@@ -1031,6 +1056,10 @@ class Haul:
     to_skip: list = field(default_factory=list)
     conflicts: list = field(default_factory=list)
     placed: list = field(default_factory=list)      # frames whose dest we copied/renamed
+    audio_to_copy: list = field(default_factory=list)   # frames whose WAV we'll place
+    audio_to_skip: list = field(default_factory=list)   # WAV already present (same size)
+    audio_conflicts: list = field(default_factory=list)  # different file at the WAV name
+    audio_placed: list = field(default_factory=list)    # WAVs we actually copied/renamed
     _iptc: dict = field(default=None, init=False, repr=False)   # cached folder-constant fields
 
     # --- planning ------------------------------------------------------------
@@ -1081,8 +1110,17 @@ class Haul:
             # Effective offset is shot_tz's target when set (we restamp the tags to it),
             # else the camera's recorded offset (unchanged without shot_tz).
             offset = self.shot_tz if self.shot_tz is not None else rec_off
-            self.frames.append(Frame(src, st.st_size, locked, dest, dt,
-                                     date_delta=date_delta, offset=offset))
+            frame = Frame(src, st.st_size, locked, dest, dt,
+                          date_delta=date_delta, offset=offset)
+            self._attach_audio(frame)
+            self.frames.append(frame)
+
+    def _attach_audio(self, frame):
+        """Record a sibling voice-memo WAV on the frame, if the camera wrote one."""
+        wav = audio_sibling(frame.src)
+        if wav:
+            frame.audio_src = wav
+            frame.audio_size = os.path.getsize(wav)
 
     def scan_dest(self):
         """Card-free scan for --rewrite: find already-copied files in the destination
@@ -1166,8 +1204,12 @@ class Haul:
             used_names.setdefault(base, 1)
             dest = os.path.join(self.dest_dir, base + '.' + self.ext)
             offset = self.shot_tz if self.shot_tz is not None else rec_off
-            self.frames.append(Frame(src, st.st_size, locked, dest, dt,
-                                     date_delta=date_delta, offset=offset))
+            frame = Frame(src, st.st_size, locked, dest, dt,
+                          date_delta=date_delta, offset=offset)
+            # Only the camera-named (to-rename) frames look for a WAV sibling; already-named
+            # frames are left strictly alone (their audio note was renamed in a prior run).
+            self._attach_audio(frame)
+            self.frames.append(frame)
 
     def _name_taken(self, base, src):
         """True if base+ext already exists in dest_dir as a different file than src."""
@@ -1219,7 +1261,8 @@ class Haul:
         return zone_delta + self.time_shift
 
     def classify(self):
-        """Split planned frames into copy / skip (already present) / conflict."""
+        """Split planned frames into copy / skip (already present) / conflict, and
+        classify each frame's audio note (WAV) the same way, independently of the photo."""
         for f in self.frames:
             if not os.path.isfile(f.dest):
                 self.to_copy.append(f)
@@ -1227,10 +1270,22 @@ class Haul:
                 self.to_skip.append(f)
             else:
                 self.conflicts.append(f)
+            if f.audio_src:
+                adest = f.audio_dest
+                if not os.path.isfile(adest):
+                    self.audio_to_copy.append(f)
+                elif os.path.getsize(adest) == f.audio_size:
+                    self.audio_to_skip.append(f)
+                else:
+                    self.audio_conflicts.append(f)
 
     @property
     def copy_bytes(self):
         return sum(f.size for f in self.to_copy)
+
+    @property
+    def audio_copy_bytes(self):
+        return sum(f.audio_size for f in self.audio_to_copy)
 
     # --- reporting -----------------------------------------------------------
 
@@ -1267,6 +1322,12 @@ class Haul:
         if meta:
             print('Metadata: %s%s' % (', '.join(meta),
                                       ' (rewrite/merge)' if self.rewrite else ''))
+        n_audio = len(self.audio_to_copy) + len(self.audio_to_skip) + len(self.audio_conflicts)
+        if n_audio:
+            print('Audio notes: %d (%d to %s, %d present%s)'
+                  % (n_audio, len(self.audio_to_copy), 'rename' if self.local else 'copy',
+                     len(self.audio_to_skip),
+                     (', %d CONFLICT' % len(self.audio_conflicts)) if self.audio_conflicts else ''))
         if self.errors:
             print('  %d file(s) skipped - unreadable Exif:' % len(self.errors))
             for e in self.errors:
@@ -1274,12 +1335,16 @@ class Haul:
         for f in self.conflicts:
             print('  ! CONFLICT (different size, not overwriting): %s'
                   % os.path.basename(f.dest))
+        for f in self.audio_conflicts:
+            print('  ! CONFLICT (audio note, different size, not overwriting): %s'
+                  % os.path.basename(f.audio_dest))
 
     # --- doing ---------------------------------------------------------------
 
     def copy(self):
-        """Copy every to-copy frame, updating a live progress display."""
-        progress = Progress(len(self.to_copy), self.copy_bytes)
+        """Copy every to-copy frame (and its audio note), updating a live progress display."""
+        progress = Progress(len(self.to_copy) + len(self.audio_to_copy),
+                            self.copy_bytes + self.audio_copy_bytes)
         try:
             for f in self.to_copy:
                 try:
@@ -1291,11 +1356,29 @@ class Haul:
                     continue
                 self.placed.append(f)
                 progress.file_done()
+            self._copy_audio(progress)
         finally:
             # Always terminate the progress line - even if an ExifPatchError aborts the
             # run mid-copy - so the error message starts on its own line.
             progress.finish()
         return progress
+
+    def _copy_audio(self, progress):
+        """Copy each planned voice-memo WAV next to the photo it belongs to. The WAV rides
+        along by name only - no EXIF patch, no sidecar. We place it only when the photo's
+        dest exists (placed this run or already there), so a failed photo copy never strands
+        a lone audio note. copy_file's no-clobber guard protects an unexpected occupant."""
+        for f in self.audio_to_copy:
+            if not os.path.exists(f.dest):
+                continue
+            try:
+                copy_file(f.audio_src, f.audio_dest, on_chunk=progress.tick)
+            except OSError as e:
+                self.errors.append('%s: audio copy failed (%s)'
+                                   % (os.path.basename(f.audio_dest), e))
+                continue
+            self.audio_placed.append(f)
+            progress.file_done()
 
     def relocate(self):
         """--local: move each to-rename frame to its computed dest. Returns the count.
@@ -1334,7 +1417,28 @@ class Haul:
             except OSError as e:
                 self.errors.append('%s: rename failed (%s)'
                                    % (os.path.basename(f.src), e))
+        self._relocate_audio()
         return renamed
+
+    def _relocate_audio(self):
+        """--local: rename each planned voice-memo WAV to match its photo. Plain os.rename
+        (the WAV has no EXIF to patch, even under a capture-time correction - only its name
+        tracks the photo). A locked WAV is unlocked first (the folder is ours), and we only
+        move it once the photo's dest exists, so a failed photo rename leaves the pair intact.
+        """
+        for f in self.audio_to_copy:
+            if not os.path.exists(f.dest):
+                continue
+            try:
+                if is_locked(os.stat(f.audio_src)):
+                    os.chflags(f.audio_src, 0)
+                if os.path.exists(f.audio_dest):
+                    raise OSError('destination appeared after planning, not overwriting')
+                os.rename(f.audio_src, f.audio_dest)
+                self.audio_placed.append(f)
+            except OSError as e:
+                self.errors.append('%s: audio rename failed (%s)'
+                                   % (os.path.basename(f.audio_src), e))
 
     def fields_for(self, frame):
         """The sidecar properties this frame should carry, given config + template.
@@ -1473,8 +1577,9 @@ class Haul:
             planned = [self.would_write(f) for f in self.to_copy]   # only files we'd copy
             wcount = sum(1 for p in planned if p is not None)
             pcount = sum(1 for p in planned if p)
-            print('Dry run: would copy %s, write %d sidecars (%d Purple). '
-                  'Nothing written.' % (human_bytes(self.copy_bytes), wcount, pcount))
+            print('Dry run: would copy %s, write %d sidecars (%d Purple).%s '
+                  'Nothing written.' % (human_bytes(self.copy_bytes), wcount, pcount,
+                                        self._audio_dry_note('copy')))
             return self._exit_code()
 
         progress = self.copy()
@@ -1484,6 +1589,7 @@ class Haul:
               % (progress.done_files, human_bytes(progress.done_bytes),
                  fmt_eta(progress.elapsed), progress.rate_mb,
                  len(self.to_skip), written, purple))
+        self._report_audio('copied')
         if self.errors:
             print('  %d error(s):' % len(self.errors))
             for e in self.errors:
@@ -1500,8 +1606,9 @@ class Haul:
             wcount = sum(1 for p in planned if p is not None)
             pcount = sum(1 for p in planned if p)
             print('Dry run: would rename %d (%d locked->unlock), write %d sidecars '
-                  '(%d Purple). Nothing changed.'
-                  % (len(self.to_copy), self.featured, wcount, pcount))
+                  '(%d Purple).%s Nothing changed.'
+                  % (len(self.to_copy), self.featured, wcount, pcount,
+                     self._audio_dry_note('rename')))
             return self._exit_code()
 
         renamed = self.relocate()
@@ -1509,6 +1616,7 @@ class Haul:
         print('Done: renamed %d (%d unlocked), skipped %d already named. '
               'Sidecars: %d written (%d Purple).'
               % (renamed, self.featured, len(self.to_skip), written, purple))
+        self._report_audio('renamed')
         if self.errors:
             print('  %d error(s):' % len(self.errors))
             for e in self.errors:
@@ -1538,8 +1646,20 @@ class Haul:
                 print('    ! ' + e)
         return self._exit_code()
 
+    def _report_audio(self, verb):
+        """Print the audio-note tally (placed vs. already present), if any were found."""
+        if self.audio_to_copy or self.audio_to_skip or self.audio_conflicts:
+            print('  Audio notes: %d %s, %d already present.'
+                  % (len(self.audio_placed), verb, len(self.audio_to_skip)))
+
+    def _audio_dry_note(self, verb):
+        """One-clause audio summary for a dry-run line, or '' if there are no audio notes."""
+        if not self.audio_to_copy:
+            return ''
+        return ' Audio notes: %d to %s.' % (len(self.audio_to_copy), verb)
+
     def _exit_code(self):
-        return 1 if (self.errors or self.conflicts) else 0
+        return 1 if (self.errors or self.conflicts or self.audio_conflicts) else 0
 
 
 # ---------------------------------------------------------------------------
@@ -1561,8 +1681,9 @@ def build_parser():
             'with a Purple label for Lightroom via an .xmp sidecar. Copyright/creator\n'
             '(from ~/.photohaul) and a per-folder template (photohaul.json) - an\n'
             'AP-style caption plus structured IPTC fields - go into that sidecar too.\n'
-            'The card is never modified, and the copy is a byte-exact clone unless a\n'
-            'capture-time correction (time_shift / shot_tz) is set.'),
+            'An in-camera voice memo (a sidecar .WAV) rides along, renamed to match\n'
+            'its photo. The card is never modified, and the copy is a byte-exact clone\n'
+            'unless a capture-time correction (time_shift / shot_tz) is set.'),
         epilog=(
             'examples:\n'
             '  photohaul                     use the default format from ~/.photohaul\n'

@@ -9,7 +9,9 @@ millisecond-precise timestamp, and writes Lightroom-friendly XMP sidecars
 (color label, copyright/creator, an AP-style caption, and the structured IPTC
 fields a photo desk expects — headline, credit/source, city/state/country,
 location, usage terms, keywords). Reads Exif from Sony ARW, Nikon NEF, DNG
-(Adobe/Ricoh), Fuji RAF, Canon CR3, and JPEG. **Zero dependencies** — stdlib only,
+(Adobe/Ricoh), Fuji RAF, Canon CR3, and JPEG. An in-camera voice memo (a sidecar
+`.WAV` sharing the photo's basename, Sony/Nikon) is brought along, renamed to match
+its photo (`docs/20260608_audio_notes_plan.md`). **Zero dependencies** — stdlib only,
 including a hand-rolled Exif reader (TIFF — covering ARW/NEF/DNG — plus standalone
 JPEG and the RAF/CR3 containers) and XMP writer. No exiftool, no pip installs.
 
@@ -44,6 +46,12 @@ The script is run from a destination folder; it's copied to `~/bin` by hand.
   already exists (preserving everything else, e.g. Lightroom develop edits) and skips
   (reports) files that have none — it never creates one. An unparseable sidecar is
   reported and left untouched, never clobbered.
+- **A voice-memo WAV follows its photo by name.** A sibling `.WAV` (same stem on the
+  card) is attached to the `Frame` and placed at the photo's final name + `.wav` —
+  copied byte-exact (card) or renamed in place (`--local`). It carries no Exif (so a
+  capture-time correction changes only its name, never its bytes) and gets no XMP
+  sidecar. Idempotent and no-clobber like the raw; classified separately
+  (`audio_to_copy`/`audio_to_skip`/`audio_conflicts`). `--rewrite` ignores audio.
 
 ## Configuration surfaces
 - `~/.photohaul` — INI, parsed with `configparser` (`interpolation=None`).
