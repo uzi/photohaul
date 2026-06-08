@@ -104,10 +104,11 @@ or `--locked`/`--unlocked`. See `docs/20260606_local_mode_plan.md`.
   seeks, small pure functions. No new third-party packages.
 - **Automated tests** live in `tests/` — stdlib `unittest`, zero
   dependencies, no binaries committed: `python3 -m unittest discover -s tests`. The
-  Exif reader/patcher is exercised against minimal TIFF/JPEG fixtures built in memory
-  (`build_tiff`/`build_jpeg`), and the Haul flow against synthetic cards in a tempdir;
-  `samples/` is only read by opt-in skip-unless tests. Add a case alongside any
-  behavior change here.
+  Exif reader/patcher is exercised against minimal in-memory fixtures — the TIFF
+  (`build_tiff`, with an `exif_ptr=False` variant for the CR3/CMT2 IFD0 shape) and the
+  containers that wrap it: JPEG (`build_jpeg`), Fuji RAF (`build_raf`), and Canon CR3
+  (`build_cr3`) — and the Haul flow against synthetic cards in a tempdir; `samples/` is
+  only read by opt-in skip-unless tests. Add a case alongside any behavior change here.
 - **Also test against the real card or a scratch dir.** A dry run against the mounted
   card should report the right total/featured split; a real copy into a scratch
   dir verifies names, sidecars, unlocked copies, and that an immediate re-run

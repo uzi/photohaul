@@ -12,6 +12,7 @@
 
 import contextlib
 import io
+import json
 import os
 import stat
 import struct
@@ -33,11 +34,16 @@ import photohaul as ph  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def build_tiff(bo='<', date='2026:05:26 14:00:24', subsec='708', offset='+09:00',
-               datetime_ifd0=None):
-    """A minimal valid Exif TIFF as bytes: header | IFD0 (-> Exif IFD) | Exif IFD |
+               datetime_ifd0=None, exif_ptr=True):
+    """A minimal valid Exif TIFF as bytes: header | IFD0 [(-> Exif IFD) | Exif IFD] |
     overflow. `bo` is '<' (II) or '>' (MM). Pass date=None to omit DateTimeOriginal,
     subsec/offset=None to omit those tags, datetime_ifd0 to add IFD0's DateTime (0x0132).
     ASCII values <=4 bytes go inline; larger ones into the overflow region.
+
+    exif_ptr=True (default) puts the date/subsec/offset tags in a sub-IFD reached via
+    EXIF_IFD_PTR - the ARW/NEF/RAF/JPEG shape. exif_ptr=False drops them straight into
+    IFD0 with no Exif pointer (the Canon CR3 CMT2 shape), exercising the
+    `elif DATETIME_ORIGINAL in e0` branch of _exif_ifds.
     """
     def az(s):
         return s.encode('ascii') + b'\x00'
@@ -49,16 +55,19 @@ def build_tiff(bo='<', date='2026:05:26 14:00:24', subsec='708', offset='+09:00'
         exif.append((ph.OFFSET_TIME_ORIGINAL, az(offset)))
     if subsec is not None:
         exif.append((ph.SUBSEC_ORIGINAL, az(subsec)))
-    exif.sort(key=lambda e: e[0])
 
     ifd0_extra = []
     if datetime_ifd0 is not None:
         ifd0_extra.append((ph.DATETIME, az(datetime_ifd0)))
+    if not exif_ptr:                     # CR3/CMT2 shape: date tags live in IFD0 itself
+        ifd0_extra += exif
+        exif = []
+    exif.sort(key=lambda e: e[0])
 
-    ifd0_count = len(ifd0_extra) + 1            # + EXIF_IFD_PTR
+    ifd0_count = len(ifd0_extra) + (1 if exif_ptr else 0)   # + EXIF_IFD_PTR
     ifd0_size = 2 + 12 * ifd0_count + 4
     exif_offset = 8 + ifd0_size
-    exif_size = 2 + 12 * len(exif) + 4
+    exif_size = (2 + 12 * len(exif) + 4) if exif_ptr else 0
     overflow_base = exif_offset + exif_size
     overflow = bytearray()
 
@@ -73,17 +82,21 @@ def build_tiff(bo='<', date='2026:05:26 14:00:24', subsec='708', offset='+09:00'
         return struct.pack(bo + 'HHI', tag, typ, count) + vf
 
     ifd0_items = [(tag, 2, len(p), vfield(p)) for tag, p in ifd0_extra]
-    ifd0_items.append((ph.EXIF_IFD_PTR, 4, 1, struct.pack(bo + 'I', exif_offset)))
+    if exif_ptr:
+        ifd0_items.append((ph.EXIF_IFD_PTR, 4, 1, struct.pack(bo + 'I', exif_offset)))
     ifd0_items.sort(key=lambda e: e[0])
     ifd0_bytes = struct.pack(bo + 'H', ifd0_count)
     for tag, typ, count, vf in ifd0_items:
         ifd0_bytes += entry(tag, typ, count, vf)
     ifd0_bytes += struct.pack(bo + 'I', 0)
 
-    exif_bytes = struct.pack(bo + 'H', len(exif))
-    for tag, p in exif:
-        exif_bytes += entry(tag, 2, len(p), vfield(p))
-    exif_bytes += struct.pack(bo + 'I', 0)
+    if exif_ptr:
+        exif_bytes = struct.pack(bo + 'H', len(exif))
+        for tag, p in exif:
+            exif_bytes += entry(tag, 2, len(p), vfield(p))
+        exif_bytes += struct.pack(bo + 'I', 0)
+    else:
+        exif_bytes = b''
 
     header = (b'II' if bo == '<' else b'MM') + struct.pack(bo + 'H', 42) + struct.pack(bo + 'I', 8)
     return header + ifd0_bytes + exif_bytes + bytes(overflow)
@@ -93,6 +106,34 @@ def build_jpeg(**kw):
     """Minimal JPEG carrying the same Exif TIFF in an APP1/Exif segment."""
     app1 = b'Exif\x00\x00' + build_tiff(**kw)
     return b'\xff\xd8\xff\xe1' + struct.pack('>H', len(app1) + 2) + app1
+
+
+def build_raf(jpg_off=0x100, **kw):
+    """Minimal Fuji RAF: the FUJIFILMCCD-RAW magic, a JpgImageOffset (BE u32) at 0x54,
+    then an embedded JPEG (build_jpeg) carrying the Exif TIFF. Exercises _raf_exif_base
+    and the _jpeg_exif_base marker walk against a non-zero embedded offset.
+    """
+    buf = bytearray(jpg_off)
+    buf[:len(ph.FUJI_MAGIC)] = ph.FUJI_MAGIC
+    struct.pack_into('>I', buf, ph.RAF_JPEG_OFFSET, jpg_off)
+    return bytes(buf) + build_jpeg(**kw)
+
+
+def _box(typ, payload):
+    """One ISO-BMFF box: 32-bit size | 4-char type | payload."""
+    return struct.pack('>I', len(payload) + 8) + typ + payload
+
+
+def build_cr3(**kw):
+    """Minimal Canon CR3 (ISO-BMFF): an ftyp/crx box + a moov > uuid > CMT2 tree whose
+    CMT2 payload is a standalone Exif TIFF (the CR3 carries the date tags directly in
+    IFD0, so exif_ptr=False). Exercises _cr3_exif_base and the recursive _bmff_find,
+    including its 16-byte uuid-usertype skip.
+    """
+    ftyp = _box(b'ftyp', ph.CR3_BRAND + b'\x00\x00\x00\x00' + ph.CR3_BRAND)
+    cmt2 = _box(b'CMT2', build_tiff(exif_ptr=False, **kw))
+    moov = _box(b'moov', _box(b'uuid', b'\x00' * 16 + cmt2))
+    return ftyp + moov
 
 
 def rb(path):
@@ -388,6 +429,60 @@ class TestSidecarStructure(TempCase):
 
 
 # ---------------------------------------------------------------------------
+# Merge into non-standard RDF: a property we own pre-existing in *attribute* form, or
+# on a *second* rdf:Description. _clear_prop must sweep both forms across all
+# Descriptions so the merge replaces (not duplicates) and never strands the old value.
+# ---------------------------------------------------------------------------
+
+# Our own xmp:Label carried as an attribute (Lightroom writes labels this way),
+# alongside a foreign crs develop edit on the same Description.
+ATTR_LABEL_SIDECAR = (
+    '<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+    '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+    'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+    '<rdf:Description rdf:about="" '
+    'xmlns:xmp="http://ns.adobe.com/xap/1.0/" '
+    'xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" '
+    'xmp:Label="Green" crs:Exposure2012="+0.85"/>'
+    '</rdf:RDF></x:xmpmeta>\n<?xpacket end="w"?>\n')
+
+# Two Descriptions; our photoshop:City lives (as an attribute) on the *second* one.
+TWO_DESC_SIDECAR = (
+    '<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
+    '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF '
+    'xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+    '<rdf:Description rdf:about="" '
+    'xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/" crs:Contrast2012="+22"/>'
+    '<rdf:Description rdf:about="" '
+    'xmlns:photoshop="http://ns.adobe.com/photoshop/1.0/" photoshop:City="OldCity"/>'
+    '</rdf:RDF></x:xmpmeta>\n<?xpacket end="w"?>\n')
+
+
+class TestSidecarMergeComplex(TempCase):
+    def test_attribute_form_label_replaced_not_duplicated(self):
+        path = self.write('al.xmp', ATTR_LABEL_SIDECAR)
+        self.assertTrue(ph.write_sidecar(path, {'label': 'Purple'}, merge=True))
+        root = ET.parse(path).getroot()
+        labels = root.findall('.//' + ph._q('xmp', 'Label'))
+        self.assertEqual(len(labels), 1)                 # single element, no leftover attr
+        self.assertEqual(labels[0].text, 'Purple')
+        for d in root.findall('.//' + ph._q('rdf', 'Description')):
+            self.assertNotIn(ph._q('xmp', 'Label'), d.attrib)   # old attribute cleared
+        self.assertIn('Exposure2012', rt(path))          # foreign develop edit preserved
+
+    def test_property_on_second_description_replaced(self):
+        path = self.write('td.xmp', TWO_DESC_SIDECAR)
+        self.assertTrue(ph.write_sidecar(path, {'city': 'Springfield'}, merge=True))
+        root = ET.parse(path).getroot()
+        cities = root.findall('.//' + ph._q('photoshop', 'City'))
+        self.assertEqual(len(cities), 1)                 # one survivor across both Descriptions
+        self.assertEqual(cities[0].text, 'Springfield')
+        for d in root.findall('.//' + ph._q('rdf', 'Description')):
+            self.assertNotIn(ph._q('photoshop', 'City'), d.attrib)
+        self.assertIn('Contrast2012', rt(path))          # other Description's edit preserved
+
+
+# ---------------------------------------------------------------------------
 # EXIF reader (synthetic fixtures)
 # ---------------------------------------------------------------------------
 
@@ -421,6 +516,48 @@ class TestExifReader(TempCase):
 
     def test_not_a_tiff_raises(self):
         path = self.write('junk.arw', b'this is not a tiff header at all')
+        with self.assertRaises(ValueError):
+            ph.read_exif_datetime(path)
+
+    def test_date_in_ifd0_no_exif_pointer(self):
+        # CR3/CMT2 shape: tags sit in IFD0 with no EXIF_IFD_PTR (the elif branch).
+        path = self.write('ifd0.tif', build_tiff(exif_ptr=False))
+        self.assertEqual(ph.read_exif_datetime(path), ('2026:05:26 14:00:24', '708', '+09:00'))
+
+
+# ---------------------------------------------------------------------------
+# Container parsers - RAF (embedded JPEG) and CR3 (ISO-BMFF), built in-memory so
+# the real-format parsers get exercised in CI without committing any raws.
+# ---------------------------------------------------------------------------
+
+class TestContainerFormats(TempCase):
+    def test_reads_raf(self):
+        path = self.write('a.raf', build_raf())
+        self.assertEqual(ph.read_exif_datetime(path), ('2026:05:26 14:00:24', '708', '+09:00'))
+
+    def test_reads_raf_big_endian(self):
+        path = self.write('be.raf', build_raf(bo='>'))
+        self.assertEqual(ph.read_exif_datetime(path), ('2026:05:26 14:00:24', '708', '+09:00'))
+
+    def test_reads_cr3(self):
+        path = self.write('a.cr3', build_cr3())
+        self.assertEqual(ph.read_exif_datetime(path), ('2026:05:26 14:00:24', '708', '+09:00'))
+
+    def test_raf_without_exif_raises(self):
+        # An embedded JPEG that's just SOI+EOI - no APP1/Exif. The marker walk hits EOI.
+        jpg_off = 0x100
+        buf = bytearray(jpg_off)
+        buf[:len(ph.FUJI_MAGIC)] = ph.FUJI_MAGIC
+        struct.pack_into('>I', buf, ph.RAF_JPEG_OFFSET, jpg_off)
+        path = self.write('noexif.raf', bytes(buf) + b'\xff\xd8\xff\xd9')
+        with self.assertRaises(ValueError):
+            ph.read_exif_datetime(path)
+
+    def test_cr3_without_cmt2_raises(self):
+        # ftyp + moov > uuid, but no CMT2 box inside: _bmff_find returns None.
+        ftyp = _box(b'ftyp', ph.CR3_BRAND + b'\x00\x00\x00\x00' + ph.CR3_BRAND)
+        moov = _box(b'moov', _box(b'uuid', b'\x00' * 16))
+        path = self.write('nocmt2.cr3', ftyp + moov)
         with self.assertRaises(ValueError):
             ph.read_exif_datetime(path)
 
@@ -477,6 +614,16 @@ class TestCopyFile(TempCase):
         self.assertEqual(os.path.getsize(dest), os.path.getsize(src))   # same byte length
         dt, _s, off = ph.read_exif_datetime(dest)
         self.assertEqual((dt, off), ('2026:05:26 15:00:24', '+10:00'))
+
+    def test_patch_failure_removes_partial_and_dest(self):
+        # An unparseable date defeats the in-place patch: the .partial is removed and no
+        # final file is left, so an aborted correction never strands a bad copy.
+        src = self.write('src4.arw', build_tiff(date='0000:00:00 00:00:00'))
+        dest = os.path.join(self.tmp, 'dest4.arw')
+        with self.assertRaises(ph.ExifPatchError):
+            ph.copy_file(src, dest, date_delta=timedelta(hours=1))
+        self.assertFalse(os.path.exists(dest))
+        self.assertFalse(os.path.exists(dest + '.partial'))
 
 
 # ---------------------------------------------------------------------------
@@ -777,6 +924,202 @@ class TestRewrite(TempCase):
         self.write('Z.xmp', LABEL_SIDECAR)
         silent(self._haul(self.tmp).run)
         self.assertEqual(ph.read_label(os.path.join(self.tmp, 'Z.xmp')), 'Purple')
+
+
+# ---------------------------------------------------------------------------
+# Dry run touches nothing (the user-trust contract: no copy/rename/patch/unlock/sidecar)
+# ---------------------------------------------------------------------------
+
+class TestDryRun(TempCase):
+    def test_card_dry_run_writes_nothing(self):
+        card = os.path.join(self.tmp, 'card')
+        self.write(os.path.join('card', 'DCIM', '100MSDCF', 'D.ARW'), build_tiff())
+        dest = os.path.join(self.tmp, 'dest'); os.makedirs(dest)
+        h = ph.Haul(card=card, ext='arw', dest_dir=dest, filt='all', dry_run=True,
+                    rewrite=False, config=CONFIG, template=None, profile='default',
+                    time_shift=timedelta(hours=1))
+        rc = silent(h.run)
+        self.assertEqual(rc, 0)
+        self.assertEqual(os.listdir(dest), [])                      # no copy, no sidecar, no .partial
+        # card original untouched (read-only invariant holds even in dry-run)
+        self.assertTrue(os.path.exists(os.path.join(card, 'DCIM', '100MSDCF', 'D.ARW')))
+
+    def test_local_dry_run_renames_nothing(self):
+        dest = self.tmp
+        self.write('CAM0009.ARW', build_tiff())
+        before = sorted(os.listdir(dest))
+        h = ph.Haul(card=None, ext='arw', dest_dir=dest, filt='all', dry_run=True,
+                    rewrite=False, config=CONFIG, template=None, profile='default',
+                    local=True, time_shift=timedelta(hours=1))
+        silent(h.run)
+        self.assertEqual(sorted(os.listdir(dest)), before)          # not renamed, no sidecar
+
+
+# ---------------------------------------------------------------------------
+# Template -> IPTC wiring (end to end: a populated photohaul.json reaches the sidecar)
+# ---------------------------------------------------------------------------
+
+class TestHaulMetadata(TempCase):
+    TEMPLATE = {
+        'homeShort': "Lakeside", 'awayShort': 'Riverside', 'sport': "women's volleyball",
+        'event': 'NCAA match', 'venue': 'Memorial Arena', 'city': 'Springfield', 'state': 'California',
+        'country': 'USA', 'conference': 'PCC', 'source': 'site.com', 'credit': 'Me/site.com',
+        'rightsUsage': 'Editorial use only.', 'assignment': 'Embargoed',
+    }
+
+    def _q(self, *pairs):
+        return '/'.join(ph._q(p, l) for p, l in pairs)
+
+    def test_template_fields_reach_the_sidecar(self):
+        card = os.path.join(self.tmp, 'card')
+        self.write(os.path.join('card', 'DCIM', '100MSDCF', 'M.ARW'), build_tiff())
+        dest = os.path.join(self.tmp, 'dest'); os.makedirs(dest)
+        h = ph.Haul(card=card, ext='arw', dest_dir=dest, filt='all', dry_run=False,
+                    rewrite=False, config=CONFIG, template=self.TEMPLATE, profile='default')
+        silent(h.run)
+        d = ET.parse(os.path.join(dest, '20260526-140024_708.xmp')).getroot().find(
+            './/' + ph._q('rdf', 'Description'))
+        self.assertEqual(d.find(ph._q('photoshop', 'Headline')).text,
+                         "Lakeside vs. Riverside women's volleyball")
+        self.assertEqual(d.find(ph._q('photoshop', 'Source')).text, 'site.com')
+        self.assertEqual(d.find(ph._q('photoshop', 'City')).text, 'Springfield')
+        self.assertEqual(d.find(ph._q('photoshop', 'State')).text, 'California')  # full, not AP-abbrev
+        self.assertEqual(d.find(ph._q('photoshop', 'Credit')).text, 'Me/site.com')
+        self.assertEqual(d.find(ph._q('photoshop', 'DateCreated')).text,
+                         '2026-05-26T14:00:24+09:00')                  # capture time + recorded offset
+        ut = d.find(self._q(('xmpRights', 'UsageTerms'), ('rdf', 'Alt'), ('rdf', 'li')))
+        self.assertEqual(ut.text, 'Editorial use only.')
+        kws = [li.text for li in d.findall(
+            self._q(('dc', 'subject'), ('rdf', 'Bag'), ('rdf', 'li')))]
+        self.assertEqual(kws, ["women's volleyball", "Lakeside", 'Riverside', 'PCC'])
+        desc = d.find(self._q(('dc', 'description'), ('rdf', 'Alt'), ('rdf', 'li')))
+        self.assertIn('Memorial Arena', desc.text)                      # AP caption built
+
+
+# ---------------------------------------------------------------------------
+# Partial failure: a bad frame is reported and skipped, the good one still lands,
+# and the run exits non-zero.
+# ---------------------------------------------------------------------------
+
+class TestHaulErrors(TempCase):
+    def test_unreadable_frame_skipped_run_continues_rc1(self):
+        card = os.path.join(self.tmp, 'card')
+        self.write(os.path.join('card', 'DCIM', '100MSDCF', 'GOOD.ARW'), build_tiff())
+        self.write(os.path.join('card', 'DCIM', '100MSDCF', 'BAD.ARW'), b'not a tiff at all')
+        dest = os.path.join(self.tmp, 'dest'); os.makedirs(dest)
+        h = ph.Haul(card=card, ext='arw', dest_dir=dest, filt='all', dry_run=False,
+                    rewrite=False, config=CONFIG, template=None, profile='default')
+        rc = silent(h.run)
+        self.assertEqual(rc, 1)                                       # non-zero on error
+        self.assertEqual(len(h.errors), 1)
+        self.assertTrue(os.path.exists(os.path.join(dest, '20260526-140024_708.arw')))  # good copied
+
+
+# ---------------------------------------------------------------------------
+# --local lock -> unlock -> Purple (macOS UF_IMMUTABLE; skipped elsewhere)
+# ---------------------------------------------------------------------------
+
+@unittest.skipUnless(sys.platform == 'darwin' and hasattr(os, 'chflags'),
+                     'requires macOS chflags/UF_IMMUTABLE')
+class TestHaulLocalLocked(TempCase):
+    def test_locked_camera_file_renamed_unlocked_and_purple(self):
+        dest = self.tmp
+        src = self.write('LOCK0003.ARW', build_tiff())
+        os.chflags(src, stat.UF_IMMUTABLE)
+        if not ph.is_locked(os.stat(src)):
+            self.skipTest('could not set UF_IMMUTABLE here')
+        h = ph.Haul(card=None, ext='arw', dest_dir=dest, filt='all', dry_run=False,
+                    rewrite=False, config=CONFIG, template=None, profile='default', local=True)
+        silent(h.run)
+        self.assertEqual(h.featured, 1)
+        self.assertFalse(os.path.exists(os.path.join(dest, 'LOCK0003.ARW')))     # renamed away
+        renamed = os.path.join(dest, '20260526-140024_708.arw')
+        self.assertTrue(os.path.exists(renamed))
+        self.assertFalse(ph.is_locked(os.stat(renamed)))                         # unlocked in place
+        self.assertEqual(ph.read_label(os.path.join(dest, '20260526-140024_708.xmp')), 'Purple')
+
+
+# ---------------------------------------------------------------------------
+# Config / template / --init wiring (load_config inheritance, bad JSON, scaffold)
+# ---------------------------------------------------------------------------
+
+class TestConfig(TempCase):
+    def _cfg(self, text):
+        return self.write('photohaul.ini', text)
+
+    def test_default_section(self):
+        p = self._cfg('[default]\ncreator = Me\ncopyright = (c) {year} Me\n')
+        self.assertEqual(ph.load_config(None, p),
+                         {'creator': 'Me', 'copyright': '(c) {year} Me'})
+
+    def test_profile_inherits_default(self):
+        p = self._cfg('[default]\ncreator = Me\n[work]\ncredit = Me/site.com\n')
+        cfg = ph.load_config('work', p)
+        self.assertEqual(cfg['creator'], 'Me')             # inherited from [default]
+        self.assertEqual(cfg['credit'], 'Me/site.com')     # own key
+
+    def test_legacy_flat_file_is_default(self):
+        p = self._cfg('creator = Me\ncopyright = x\n')     # no section header
+        self.assertEqual(ph.load_config(None, p), {'creator': 'Me', 'copyright': 'x'})
+
+    def test_missing_profile_exits(self):
+        p = self._cfg('[default]\ncreator = Me\n')
+        with self.assertRaises(SystemExit):
+            ph.load_config('nope', p)
+
+    def test_missing_file_named_profile_exits(self):
+        with self.assertRaises(SystemExit):
+            ph.load_config('work', os.path.join(self.tmp, 'absent'))
+
+    def test_missing_file_default_is_empty(self):
+        self.assertEqual(ph.load_config(None, os.path.join(self.tmp, 'absent')), {})
+
+
+class TestTemplate(TempCase):
+    def test_absent_is_none(self):
+        self.assertIsNone(ph.load_template(self.tmp))
+
+    def test_bad_json_exits(self):
+        self.write(ph.TEMPLATE_NAME, '{ not json')
+        with self.assertRaises(SystemExit):
+            ph.load_template(self.tmp)
+
+    def test_non_object_json_exits(self):
+        self.write(ph.TEMPLATE_NAME, '[1, 2, 3]')
+        with self.assertRaises(SystemExit):
+            ph.load_template(self.tmp)
+
+    def test_valid_object(self):
+        self.write(ph.TEMPLATE_NAME, '{"city": "Springfield"}')
+        self.assertEqual(ph.load_template(self.tmp), {'city': 'Springfield'})
+
+
+class TestWriteTemplate(TempCase):
+    def test_scaffold_blank(self):
+        silent(ph.write_template, self.tmp)
+        data = json.loads(rt(os.path.join(self.tmp, ph.TEMPLATE_NAME)))
+        self.assertEqual(data['profile'], '')
+        self.assertEqual(data['time_shift'], '')
+        for key in ph.TEMPLATE_KEYS:
+            self.assertEqual(data[key], '')
+
+    def test_seeded_from_profile(self):
+        # configparser lower-cases option names; write_template looks them up case-folded.
+        silent(ph.write_template, self.tmp, 'work', {'city': 'Springfield', 'credit': 'Me/site.com'})
+        data = json.loads(rt(os.path.join(self.tmp, ph.TEMPLATE_NAME)))
+        self.assertEqual(data['profile'], 'work')
+        self.assertEqual(data['city'], 'Springfield')
+        self.assertEqual(data['credit'], 'Me/site.com')
+        self.assertEqual(data['time_shift'], '')           # never seeded from a profile
+
+    def test_refuses_to_overwrite(self):
+        self.write(ph.TEMPLATE_NAME, '{}')
+        with self.assertRaises(SystemExit):
+            ph.write_template(self.tmp)
+
+    def test_bad_dest_dir_exits(self):
+        with self.assertRaises(SystemExit):
+            ph.write_template(os.path.join(self.tmp, 'nope'))
 
 
 # ---------------------------------------------------------------------------
