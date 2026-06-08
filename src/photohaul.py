@@ -804,9 +804,12 @@ def write_sidecar(sidecar, fields, merge):
     'description', 'usage_terms', 'keywords' (a list), plus the simple-text IPTC keys
     in _SIMPLE_IPTC ('headline','credit','source','city','state','country','location',
     'instructions','date_created').
-    merge=False -> create-if-absent (an existing sidecar is left untouched).
-    merge=True  -> set only our properties, preserving everything else (e.g.
-                   Lightroom develop edits).
+    merge=False -> create-if-absent: write a new sidecar, or leave an existing one
+                   untouched (used for files we just placed - copied/renamed).
+    merge=True  -> merge-only: update an existing sidecar in place, setting only our
+                   properties and preserving everything else (e.g. Lightroom develop
+                   edits); a file with no sidecar is skipped, never created, so we don't
+                   strand a develop-less sidecar that makes LR revert catalog-only edits.
     Returns True if written. Raises SidecarParseError if an existing sidecar
     can't be parsed - we never clobber it.
     """
@@ -814,7 +817,9 @@ def write_sidecar(sidecar, fields, merge):
         return False
     exists = os.path.exists(sidecar)
     if exists and not merge:
-        return False
+        return False        # create-if-absent: never touch an existing sidecar
+    if merge and not exists:
+        return False        # merge-only (--rewrite): never create a new sidecar
     if exists:
         try:
             root = ET.parse(sidecar).getroot()
@@ -1107,14 +1112,16 @@ class Haul:
         """Card-free, rename-in-place scan of dest_dir (the --local workflow).
 
         Lists files with the target extension (non-recursive - a working folder, not a
-        DCIM tree). A stem already matching _STAMP_RE is kept as-is (dest = src, no rename)
-        but still scanned so its sidecar gets create-if-absent attention; a camera-named
-        file gets a computed timestamp dest. Collisions resolve to the deterministic
-        -dscnumber suffix, checked against both earlier frames and files already on disk,
-        so a new frame never lands on an existing name. The in-camera protect bit survives
-        a hand-copy off the card, so a camera-named file is checked for it (like card mode):
-        a locked frame is marked Purple and unlocked in place during relocate. Already-named
-        files are left strictly alone (their lock bit too), preserving re-run idempotency.
+        DCIM tree). A stem already matching _STAMP_RE is kept as-is (dest = src) and left
+        strictly alone - not renamed, not unlocked, and (unlike before) not given a
+        sidecar: dropping a sidecar next to a raw already imported and edited in Lightroom
+        makes LR sync from it and revert catalog-only edits. A camera-named file gets a
+        computed timestamp dest. Collisions resolve to the deterministic -dscnumber suffix,
+        checked against both earlier frames and files already on disk, so a new frame never
+        lands on an existing name. The in-camera protect bit survives a hand-copy off the
+        card, so a camera-named file is checked for it (like card mode): a locked frame is
+        marked Purple and unlocked in place during relocate. (Already-named files are still
+        listed so the run reports them as skipped.)
         """
         suffix = '.' + self.ext.lower()
         names = sorted(n for n in os.listdir(self.dest_dir)
@@ -1386,24 +1393,31 @@ class Haul:
         fields = self.fields_for(frame)
         if not any(fields.values()):
             return None
-        if os.path.exists(frame.sidecar) and not self.rewrite:
-            return None
-        # In rewrite mode we never set a label, but report any preserved Purple.
-        return frame.locked if self.rewrite else bool(fields['label'])
+        exists = os.path.exists(frame.sidecar)
+        if self.rewrite:
+            # merge-only: a file without a sidecar is skipped, not created.
+            return frame.locked if exists else None
+        # create-if-absent: an existing sidecar is left untouched.
+        return None if exists else bool(fields['label'])
 
     def write_metadata(self):
-        """Write sidecars (create-if-absent, or merge under --rewrite). Returns counts.
+        """Write sidecars (create-if-absent for new files, merge-only under --rewrite).
+        Returns counts.
 
-        Only files we placed (copied/renamed) or verified-present (to_skip) get a sidecar.
-        That excludes conflicts and copy failures, whose dest holds a file we did not write
-        - we never attach our metadata to a foreign file. --rewrite owns every dest it scans.
+        We only ever sidecar files we just placed (copied/renamed), never a file already
+        in the folder. Dropping even a minimal sidecar next to a raw already imported and
+        edited in Lightroom makes LR sync from the new (develop-less) sidecar and revert
+        catalog-only edits, so already-present files are left strictly alone. --rewrite is
+        the exception and is merge-only: it updates sidecars that already exist (preserving
+        develop edits) and skips files that have none (enforced in write_sidecar).
+        Conflicts and copy failures are excluded - we never attach metadata to a file we
+        did not write.
         """
         written = purple = 0
         if self.rewrite:
-            targets = self.frames
+            targets = self.frames        # merge-only; write_sidecar skips any without a sidecar
         else:
-            ours = {id(f) for f in self.to_skip} | {id(f) for f in self.placed}
-            targets = [f for f in self.frames if id(f) in ours]
+            targets = self.placed        # only files we just copied/renamed
         for f in targets:
             if not os.path.exists(f.dest):
                 continue   # belt-and-suspenders; placed/to_skip dests exist
@@ -1430,7 +1444,7 @@ class Haul:
             return self.run_local()
 
         if self.dry_run:
-            planned = [self.would_write(f) for f in self.frames]
+            planned = [self.would_write(f) for f in self.to_copy]   # only files we'd copy
             wcount = sum(1 for p in planned if p is not None)
             pcount = sum(1 for p in planned if p)
             print('Dry run: would copy %s, write %d sidecars (%d Purple). '
@@ -1451,11 +1465,12 @@ class Haul:
         return self._exit_code()
 
     def run_local(self):
-        """Rename-in-place ingest: no card, no copy. Renames camera-named files, then
-        writes sidecars (create-if-absent, like card mode - never clobbers an edited one).
+        """Rename-in-place ingest: no card, no copy. Renames camera-named files and writes
+        create-if-absent sidecars for those only; already-named files are left strictly
+        alone (no rename, no sidecar) so we never disturb a raw already edited in Lightroom.
         """
         if self.dry_run:
-            planned = [self.would_write(f) for f in self.frames]
+            planned = [self.would_write(f) for f in self.to_copy]   # only files we'd rename
             wcount = sum(1 for p in planned if p is not None)
             pcount = sum(1 for p in planned if p)
             print('Dry run: would rename %d (%d locked->unlock), write %d sidecars '
@@ -1475,17 +1490,22 @@ class Haul:
         return self._exit_code()
 
     def run_rewrite(self):
-        """Metadata-only refresh of the destination: no card, no copying."""
+        """Metadata-only refresh of the destination: no card, no copying. Merge-only -
+        files without a sidecar are skipped (we don't create one and risk reverting
+        catalog-only Lightroom edits); they are reported so the skip isn't silent."""
+        no_sidecar = sum(1 for f in self.frames if not os.path.exists(f.sidecar))
+        skipnote = (' (%d without a sidecar, skipped)' % no_sidecar) if no_sidecar else ''
         if self.dry_run:
             planned = [self.would_write(f) for f in self.frames]
             wcount = sum(1 for p in planned if p is not None)
             pcount = sum(1 for p in planned if p)
-            print('Dry run: would write %d sidecars (%d Purple preserved). '
-                  'Nothing written.' % (wcount, pcount))
+            print('Dry run: would update %d sidecars (%d Purple preserved)%s. '
+                  'Nothing written.' % (wcount, pcount, skipnote))
             return self._exit_code()
 
         written, purple = self.write_metadata()
-        print('Done: rewrote %d sidecars (%d Purple preserved).' % (written, purple))
+        print('Done: rewrote %d sidecars (%d Purple preserved)%s.'
+              % (written, purple, skipnote))
         if self.errors:
             print('  %d error(s):' % len(self.errors))
             for e in self.errors:
@@ -1561,8 +1581,11 @@ def build_parser():
             '  - The card is read-only; it is never written to or modified.\n'
             '  - A same-named file of matching size is skipped; a different size is\n'
             '    reported as a conflict and never overwritten.\n'
-            '  - Sidecars are create-if-absent; --rewrite merges photohaul\'s fields\n'
-            '    into an existing one and preserves the rest (e.g. Lightroom edits).'))
+            '  - Sidecars are written only for files just copied/renamed; a file\n'
+            '    already in the folder is left alone (never given a develop-less\n'
+            '    sidecar that would make Lightroom revert catalog-only edits).\n'
+            '  - --rewrite is merge-only: it updates an existing sidecar (preserving\n'
+            '    Lightroom edits) and skips files that have none.'))
     ap.add_argument('extension', nargs='?', default=None, metavar='format',
                     help="raw/jpeg format to ingest (arw, cr3, nef, raf, dng, jpg); overrides "
                          "'format' in ~/.photohaul. No built-in default.")
@@ -1580,8 +1603,9 @@ def build_parser():
     ap.add_argument('--rewrite', action='store_true',
                     help='refresh sidecar metadata on already-copied files in the '
                          'destination; the card is not used and nothing is copied. '
-                         'Merges our fields (rights, creator, caption, IPTC) into '
-                         'existing sidecars and preserves the rest, including any Purple label')
+                         'Merge-only: updates our fields (rights, creator, caption, IPTC) '
+                         'in sidecars that already exist (preserving the rest, including '
+                         'Lightroom edits and any Purple label) and skips files with no sidecar')
     ap.add_argument('--local', action='store_true',
                     help='rename camera-named files already in the destination in place '
                          '(no card, no copy); files already timestamp-named are left alone')

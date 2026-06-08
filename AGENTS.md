@@ -32,9 +32,14 @@ The script is run from a destination folder; it's copied to `~/bin` by hand.
   correction (`docs/20260605_capture_time_offset_plan.md`), applied in `--local` via a
   crash-safe copy-patch-replace. If you add another exception, justify it and document it
   here.
-- **Sidecars are create-if-absent**, and `--rewrite` merges only photohaul's
-  fields while preserving everything else (e.g. Lightroom develop edits). An
-  unparseable sidecar is reported and left untouched, never clobbered.
+- **Sidecars are written only for files we just placed** (copied/renamed); a file
+  already in the folder never gets a freshly-created sidecar. Creating a develop-less
+  sidecar next to a raw already imported and edited in Lightroom makes LR sync from it
+  and revert catalog-only edits, so already-present files are left strictly alone.
+  `--rewrite` is **merge-only**: it merges photohaul's fields into a sidecar that
+  already exists (preserving everything else, e.g. Lightroom develop edits) and skips
+  (reports) files that have none — it never creates one. An unparseable sidecar is
+  reported and left untouched, never clobbered.
 
 ## Configuration surfaces
 - `~/.photohaul` — INI, parsed with `configparser` (`interpolation=None`).
@@ -57,15 +62,21 @@ The script is run from a destination folder; it's copied to `~/bin` by hand.
 ## `--rewrite` is card-free
 `--rewrite` is a destination-only metadata refresh: no card, no copying. It scans
 the destination for already-copied files, reads their EXIF, and merges
-rights/creator/caption into existing sidecars. An existing Purple label is
-preserved as-is and never added or removed (lock status is unknown without the
-card). It errors if combined with `--locked`/`--unlocked`.
+rights/creator/caption into **existing** sidecars only — **merge-only**: a dest file
+with no sidecar is skipped and reported, never given a freshly-created (develop-less)
+one, since that would make Lightroom revert catalog-only edits. An existing Purple
+label is preserved as-is and never added or removed (lock status is unknown without
+the card). It errors if combined with `--locked`/`--unlocked`.
 
 ## `--local` is card-free too (but renames)
 `--local` ingests files already sitting in the destination (you copied them off the card
 by hand — X100VI, Ricoh GR): no card, no copy. It **renames** camera-named files in place
-to the timestamp name and writes create-if-absent sidecars; files already matching the
-timestamp pattern are left alone. Unlike `--rewrite`, it changes filenames (and, under a
+to the timestamp name and writes create-if-absent sidecars **for those renamed files
+only**; files already matching the timestamp pattern get no sidecar at all (writing one
+next to a raw already imported and edited in Lightroom makes LR sync from it and revert
+catalog-only develop edits — `--rewrite` updates an existing sidecar in place but won't
+create one either).
+Unlike `--rewrite`, it changes filenames (and, under a
 capture-time correction, EXIF). The in-camera protect bit survives a hand-copy off the
 card, so a camera-named locked frame is detected, **unlocked in place** (clearing the
 `uchg` flag — in-bounds here because the folder is ours, unlike the read-only card) and

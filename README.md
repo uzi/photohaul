@@ -232,14 +232,21 @@ When both are set they compose (date fields shift by the sum; offsets set to
 > flag (a forgotten flag could silently rename everything). `--rewrite` ignores
 > both keys, since the destination files already carry the corrected time.
 
-Sidecars are **create-if-absent** by default. `photohaul --rewrite` refreshes
-them on files **already in the destination** — no card is needed and nothing is
-copied. It **merges** only photohaul's fields (copyright, creator, caption),
-preserving everything else (e.g. Lightroom develop edits). An existing **Purple
-label is kept as-is**; because lock status is only known from the card, rewrite
-never adds or removes a label. An existing sidecar that can't be parsed is
-reported and left untouched, never overwritten. `--rewrite` cannot be combined
-with `--locked`/`--unlocked`.
+photohaul writes a sidecar only for files it just **placed** (copied or renamed) — never
+for a file already in the folder. Dropping even a minimal sidecar next to a raw you've
+already imported and edited in Lightroom makes Lightroom sync from that new (develop-less)
+sidecar and revert your catalog-only develop edits, so already-present files are left
+strictly alone.
+
+`photohaul --rewrite` refreshes metadata on files **already in the destination** — no card
+is needed and nothing is copied. It is **merge-only**: it merges photohaul's fields
+(copyright, creator, caption) into a sidecar that **already exists**, preserving everything
+else (e.g. Lightroom develop edits), and **skips (and reports) files that have no
+sidecar** rather than creating one — again so it can't revert catalog-only edits. An
+existing **Purple label is kept as-is**; because lock status is only known from the card,
+rewrite never adds or removes a label. An existing sidecar that can't be parsed is reported
+and left untouched, never overwritten. `--rewrite` cannot be combined with
+`--locked`/`--unlocked`.
 
 ## `--local` — rename files already in a folder
 
@@ -252,14 +259,17 @@ $ photohaul --local raf            # operates on the current folder (or --dest)
 DSCF1234.RAF  ->  20260501-123456_708.raf
 ```
 
-Files whose names already match the timestamp pattern are left untouched, so it's
-safe to re-run after dropping in more photos — only the new ones are renamed.
-A new photo whose timestamp collides with an existing one is kept under a
-`…-<number>` suffix (the existing file is never overwritten). Sidecars are written
-create-if-absent, exactly as in card mode (rights from `~/.photohaul`, caption/IPTC
-from a `photohaul.json` if present). A capture-time correction (`time_shift` /
-`shot_tz`) is honored, applied to the renamed file via a crash-safe
-copy-patch-replace. The in-camera **protect bit survives a hand-copy off the card**,
+Files whose names already match the timestamp pattern are left **strictly untouched** —
+not renamed, and **no sidecar is written for them** — so it's safe to re-run after
+dropping in more photos; only the new ones are renamed and sidecar'd. (Writing a sidecar
+next to a raw you've already imported and edited in Lightroom would make Lightroom sync
+from that new sidecar and revert your catalog-only develop edits, so `--local` never does
+it. `photohaul --rewrite` will *update* a sidecar that already exists, but likewise won't
+create one for a file that has none.) A new photo whose timestamp collides with an existing one is kept under
+a `…-<number>` suffix (the existing file is never overwritten). Newly renamed files get
+create-if-absent sidecars (rights from `~/.photohaul`, caption/IPTC from a
+`photohaul.json` if present). A capture-time correction (`time_shift` / `shot_tz`) is
+honored, applied to the renamed file via a crash-safe copy-patch-replace. The in-camera **protect bit survives a hand-copy off the card**,
 so a locked frame is unlocked in place and Purple-labelled, just as in card mode.
 `--local` cannot be combined with `--rewrite`, `--source`, or `--locked`/`--unlocked`.
 

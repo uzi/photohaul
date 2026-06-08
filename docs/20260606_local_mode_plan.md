@@ -2,6 +2,16 @@
 
 Status: implemented (2026-06-06)
 
+**Amendment (2026-06-07):** the original design wrote create-if-absent sidecars for
+already-named frames too (the "missing-sidecar gap-fill" below). That backfired: dropping
+even a minimal rights-only sidecar next to a raw already imported and edited in Lightroom
+made LR sync from the new (develop-less) sidecar and **revert catalog-only develop edits**
+(it also induced LR to start writing `.xmp`/`.acr` mask files for those frames). So
+`--local` now writes sidecars for the **renamed (placed) frames only**; already-named
+frames are left strictly alone (no rename, no sidecar). The gap-fill case is intentionally
+dropped — use `--rewrite` to (re)write sidecars on files already in place. The
+create-if-absent passages below describe the original behavior and are superseded by this.
+
 A third mode for the "I already copied a few frames into a folder by hand" workflow
 (X100VI, Ricoh GR), preserving what the old `~/bin/rawsort.py` did: rename camera-named
 files in a folder to the stable timestamp name **in place**, no card, no copy. Unlike
