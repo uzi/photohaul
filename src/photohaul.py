@@ -1038,9 +1038,11 @@ class Haul:
     def scan(self):
         """Pre-scan the card: read Exif + lock bit, compute names, apply the filter.
 
-        Builds destination names purely from intrinsic metadata so re-runs are stable.
-        On the (near-impossible, single-body) chance two frames map to one name, fall
-        back to the intrinsic DSC file number rather than ever risk an overwrite.
+        Names derive from intrinsic capture time. When two frames share a timestamp
+        (notably when the camera writes no SubSec, dropping names to second precision so
+        a burst collides), _unique_base falls back to the intrinsic DSC number,
+        size-aware so the choice is order- and subset-independent - partial-then-full and
+        multi-card imports stay idempotent and never duplicate or overwrite.
         """
         if self.rewrite:
             return self.scan_dest()
@@ -1074,11 +1076,7 @@ class Haul:
                 self.errors.append('%s: bad capture time (%s)'
                                    % (os.path.basename(src), e))
                 continue
-            if base in used_names:
-                used_names[base] += 1
-                base = '%s-%s' % (base, dsc_number(src))
-            else:
-                used_names[base] = 1
+            base = self._unique_base(base, src, st.st_size, used_names)
             dest = os.path.join(self.dest_dir, base + '.' + self.ext)
             # Effective offset is shot_tz's target when set (we restamp the tags to it),
             # else the camera's recorded offset (unchanged without shot_tz).
@@ -1175,6 +1173,34 @@ class Haul:
         """True if base+ext already exists in dest_dir as a different file than src."""
         cand = os.path.join(self.dest_dir, base + '.' + self.ext)
         return os.path.exists(cand) and os.path.abspath(cand) != os.path.abspath(src)
+
+    def _unique_base(self, base, src, size, used_names):
+        """A collision-proof, idempotent destination stem for one card frame (card mode).
+
+        The bare `base` is used only if no other frame this run claimed it and the dest
+        holds no *different* file there - a same-size file at that name is this frame's
+        own prior copy, so we keep the name and let classify skip it. Otherwise fall back
+        to the intrinsic `-dscnumber` suffix, extending (`-2`, `-3`, ...) until free. The
+        choice depends only on the frame and the on-disk state, never on scan order or
+        which other frames are present, so a different photo sharing a timestamp is
+        imported under its own name instead of duplicating one frame and conflicting the
+        other. `used_names` maps an assigned stem to the src that claimed it this run.
+        """
+        def free(stem):
+            if used_names.get(stem, src) != src:
+                return False                       # another frame this run took this stem
+            cand = os.path.join(self.dest_dir, stem + '.' + self.ext)
+            try:
+                return not os.path.exists(cand) or os.path.getsize(cand) == size
+            except OSError:
+                return False
+        if not free(base):
+            suffixed = '%s-%s' % (base, dsc_number(src))
+            base, n = suffixed, 2
+            while not free(base):
+                base, n = '%s-%d' % (suffixed, n), n + 1
+        used_names[base] = src
+        return base
 
     def _date_delta(self, src, rec_off):
         """Total wall-clock shift for a frame: zone_delta (from shot_tz) + time_shift.
@@ -1579,8 +1605,9 @@ def build_parser():
             '\n'
             'invariants:\n'
             '  - The card is read-only; it is never written to or modified.\n'
-            '  - A same-named file of matching size is skipped; a different size is\n'
-            '    reported as a conflict and never overwritten.\n'
+            '  - A same-named file of matching size is skipped (idempotent re-run); a\n'
+            '    different file sharing a timestamp is imported under a -NNNNN suffix,\n'
+            '    never overwritten.\n'
             '  - Sidecars are written only for files just copied/renamed; a file\n'
             '    already in the folder is left alone (never given a develop-less\n'
             '    sidecar that would make Lightroom revert catalog-only edits).\n'

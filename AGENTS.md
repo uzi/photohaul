@@ -21,8 +21,12 @@ The script is run from a destination folder; it's copied to `~/bin` by hand.
   verified on Sony and Fuji), a read. `--local` mode uses no card; it **renames files in
   place** in the working folder (`docs/20260606_local_mode_plan.md`).
 - **Re-runs are idempotent.** Card mode: destination names derive purely from intrinsic
-  capture time, a present file of matching size is skipped, a different size is a reported
-  conflict, never overwritten. `--local`: a file whose name already matches the timestamp
+  capture time, a present file of matching size is skipped. Two frames sharing a timestamp
+  (e.g. a no-subsec burst, or two cards) are disambiguated by a size-aware `-dscnumber`
+  suffix (`Haul._unique_base`): a same-size file at a name is that frame's own prior copy
+  (kept, skipped), a *different* file forces the suffix - so a colliding photo is imported
+  under its own name, never overwriting and never duplicating, idempotent across partial
+  and repeat runs. `--local`: a file whose name already matches the timestamp
   pattern (`_STAMP_RE`) is left alone, so re-runs only touch newly-added camera files.
   Anything that makes names depend on extrinsic input must be deterministic across runs
   (see capture-time offset).
@@ -98,7 +102,13 @@ or `--locked`/`--unlocked`. See `docs/20260606_local_mode_plan.md`.
   a bug.
 - **Match the existing code's style** — terse, dependency-free, header-only Exif
   seeks, small pure functions. No new third-party packages.
-- **Test against the real card or a scratch dir.** A dry run against the mounted
+- **Automated tests** live in `tests/` — stdlib `unittest`, zero
+  dependencies, no binaries committed: `python3 -m unittest discover -s tests`. The
+  Exif reader/patcher is exercised against minimal TIFF/JPEG fixtures built in memory
+  (`build_tiff`/`build_jpeg`), and the Haul flow against synthetic cards in a tempdir;
+  `samples/` is only read by opt-in skip-unless tests. Add a case alongside any
+  behavior change here.
+- **Also test against the real card or a scratch dir.** A dry run against the mounted
   card should report the right total/featured split; a real copy into a scratch
   dir verifies names, sidecars, unlocked copies, and that an immediate re-run
   skips everything. Build a small fake card (`DCIM/<dir>/*.ARW`, `chflags uchg`
