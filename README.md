@@ -1,5 +1,7 @@
 # photohaul
 
+[![tests](https://github.com/uzi/photohaul/actions/workflows/test.yml/badge.svg)](https://github.com/uzi/photohaul/actions/workflows/test.yml)
+
 A fast, dependency-free CLI for ingesting photos off a camera card.
 
 photohaul copies raw files from a mounted card into the current folder and
@@ -295,8 +297,24 @@ Python 3, standard library only — no external packages.
 In-camera lock detection is macOS-specific: it reads the BSD `uchg` (immutable)
 flag that the exFAT driver maps the camera's protect bit onto.
 
+## Development
+
+No build, no dependencies. Run the test suite with:
+
+```sh
+make test          # or: python3 -m unittest discover -s tests
+```
+
+The suite is stdlib `unittest` with zero dependencies and no committed binaries.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for house style and [`AGENTS.md`](AGENTS.md)
+for the map of the source and the invariants that must not break.
+
 ## Design
 
 Design notes live in [`docs/`](docs/) as dated, per-topic plan documents
 (`YYYYMMDD_<topic>_plan.md`), so the directory reads as a chronological record
 of how the design evolved.
+
+## License
+
+[MIT](LICENSE) © Joshua Uziel
