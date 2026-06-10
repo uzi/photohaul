@@ -43,7 +43,7 @@ into that folder.
 | Flag | What it does |
 |------|--------------|
 | `format` | File type to ingest — `arw`, `cr3`, `nef`, `raf`, `dng`, or `jpg`. Overrides `format` in `~/.photohaul`; there is no built-in default. |
-| `--source PATH` | Card root to read from. Default: auto-detect the one mounted volume with a `DCIM/` folder under `/Volumes` (errors if there are zero or several). |
+| `--source PATH` | Card root to read from. Default: auto-detect the one mounted card with a `DCIM/` folder (macOS `/Volumes`, Linux `/media`·`/run/media`·`/mnt`, Windows drive letters); errors if there are zero or several. |
 | `--dest PATH` | Destination directory. Default: the current folder. |
 | `--locked` | Ingest only the frames you protected in-camera — your flagged keepers, copied unlocked and labelled Purple. |
 | `--unlocked` | Ingest only the unprotected frames. |
@@ -325,10 +325,14 @@ built-in default, so with neither set photohaul errors rather than guessing.
 
 ## Requirements
 
-Python 3, standard library only — no external packages.
+Python 3.10+, standard library only — no external packages. Runs on macOS,
+Linux, and Windows.
 
-In-camera lock detection is macOS-specific: it reads the BSD `uchg` (immutable)
-flag that the exFAT driver maps the camera's protect bit onto.
+In-camera lock detection reads the FAT read-only attribute the camera's protect
+bit sets, surfaced per-OS: the BSD `uchg`/`UF_IMMUTABLE` flag on macOS and the
+native `FILE_ATTRIBUTE_READONLY` on Windows. On Linux it's not read — the
+Purple-label workflow targets Lightroom, which isn't on Linux — so frames simply
+import unlocked; copying, renaming, and sidecars all work as normal.
 
 ## Development
 

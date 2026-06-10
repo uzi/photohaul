@@ -456,32 +456,101 @@ _STAMP_RE = re.compile(r'^\d{8}-\d{6}(_\d{3})?(-\d+)?$')
 
 
 # ---------------------------------------------------------------------------
-# Lock detection (read-only on source)
+# Lock detection and clearing (cross-platform)
+#
+# The camera's in-camera "protect" sets the FAT directory entry's read-only
+# attribute - the one ground truth on every card. macOS and Windows expose that bit
+# through stat; Linux doesn't, and since the lock->Purple workflow targets Lightroom
+# (which isn't on Linux) we don't chase it there. is_locked/clear_lock are bound once
+# at import per platform:
+#   macOS   - msdosfs/exfat maps the bit onto the BSD UF_IMMUTABLE flag (st_flags)
+#   Windows - the native DOS attribute (st_file_attributes & FILE_ATTRIBUTE_READONLY)
+#   Linux   - not read; frames read as unlocked (copy/rename/sidecars still work)
+# is_locked(path, st) is read-only (used on the card; it takes the caller's stat so a
+# single stat covers both lock bit and size). clear_lock(path) is only ever called on a
+# file we just placed/renamed (our copy, or a --local file in our own folder), never on
+# the card. See docs/20260610_cross_platform_plan.md.
 # ---------------------------------------------------------------------------
 
-def is_locked(st):
-    """True if the macOS immutable (uchg) flag is set on a stat result - the in-camera
-    protect bit. Takes an os.stat_result so the caller can reuse one stat for size too."""
-    return bool(getattr(st, 'st_flags', 0) & stat.UF_IMMUTABLE)
+if sys.platform == 'darwin':
+    def is_locked(path, st):
+        """True if the in-camera protect bit is set (macOS: BSD UF_IMMUTABLE)."""
+        return bool(getattr(st, 'st_flags', 0) & stat.UF_IMMUTABLE)
+
+    def clear_lock(path):
+        """Clear the protect bit on a file we placed/renamed (macOS: UF_IMMUTABLE)."""
+        try:
+            flags = os.stat(path).st_flags
+            os.chflags(path, flags & ~stat.UF_IMMUTABLE)
+        except OSError:
+            pass
+
+elif sys.platform == 'win32':
+    def is_locked(path, st):
+        """True if the in-camera protect bit is set (Windows: FILE_ATTRIBUTE_READONLY)."""
+        return bool(getattr(st, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_READONLY)
+
+    def clear_lock(path):
+        """Clear the read-only attribute (Windows: chmod toggles only that bit)."""
+        try:
+            os.chmod(path, os.stat(path).st_mode | stat.S_IWRITE)
+        except OSError:
+            pass
+
+else:                                   # Linux and other POSIX
+    # The FAT read-only bit isn't exposed through stat here, and the lock->Purple
+    # workflow targets Lightroom (not on Linux), so we don't chase it via a FAT ioctl:
+    # frames read as unlocked - nothing is mislabelled, and copy/rename/sidecars work.
+    def is_locked(path, st):
+        """Always False on Linux/other - the protect bit isn't read here."""
+        return False
+
+    def clear_lock(path):
+        """Ensure a file we placed/renamed is writable (no DOS attribute to clear)."""
+        try:
+            os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
 # Card discovery
 # ---------------------------------------------------------------------------
 
+def _candidate_card_roots():
+    """Directories that might be a card root (contain DCIM/), by platform.
+
+    macOS/Linux: each entry under the platform's removable-media base dirs. Windows:
+    each drive-letter root (C:\\ .. Z:\\), probed directly. --source bypasses all this.
+    Auto-detect is fuzzier off macOS (Linux mount points vary by distro/desktop), so
+    --source is the reliable escape hatch everywhere.
+    """
+    if sys.platform == 'win32':
+        return ['%s:\\' % chr(c) for c in range(ord('C'), ord('Z') + 1)]
+    if sys.platform == 'darwin':
+        bases = ['/Volumes']
+    else:
+        user = os.environ.get('USER', '')
+        bases = ['/run/media/' + user, '/media/' + user, '/media', '/mnt']
+    roots = []
+    for base in bases:
+        try:
+            roots += [os.path.join(base, e) for e in os.listdir(base)]
+        except OSError:
+            continue
+    return roots
+
+
 def find_card(source):
-    """Resolve the card root (a dir containing DCIM/). Auto-detect under /Volumes."""
+    """Resolve the card root (a dir containing DCIM/). Auto-detect mounted media."""
     if source:
         if not os.path.isdir(os.path.join(source, 'DCIM')):
             sys.exit("Error: no DCIM/ under %s" % source)
         return source
-    candidates = []
-    for entry in sorted(os.listdir('/Volumes')):
-        root = os.path.join('/Volumes', entry)
-        if os.path.isdir(os.path.join(root, 'DCIM')):
-            candidates.append(root)
+    candidates = sorted({r for r in _candidate_card_roots()
+                         if os.path.isdir(os.path.join(r, 'DCIM'))})
     if not candidates:
-        sys.exit("Error: no card with a DCIM/ folder found under /Volumes. "
+        sys.exit("Error: no card with a DCIM/ folder found on mounted media. "
                  "Use --source to point at one.")
     if len(candidates) > 1:
         sys.exit("Error: multiple cards found (%s). Use --source to pick one."
@@ -956,12 +1025,13 @@ def copy_file(src, dest, on_chunk=None, date_delta=timedelta(0), target_offset=N
         os.remove(partial)
         raise OSError('destination appeared after planning, not overwriting')
     os.rename(partial, dest)
-    # Belt-and-suspenders: ensure the copy is unlocked and writable.
+    # Belt-and-suspenders: ensure the copy is unlocked and writable. (A fresh copy on a
+    # normal disk carries no protect bit, so this is defensive; clear_lock is per-OS.)
+    clear_lock(dest)
     try:
-        os.chflags(dest, 0)
+        os.chmod(dest, os.stat(dest).st_mode | stat.S_IWUSR)
     except OSError:
         pass
-    os.chmod(dest, os.stat(dest).st_mode | stat.S_IWUSR)
     return total
 
 
@@ -1105,7 +1175,7 @@ class Haul:
         used_names = {}
         for src in scan_source(self.card, self.ext):
             st = os.stat(src)               # one stat for both lock bit and size
-            locked = is_locked(st)
+            locked = is_locked(src, st)
             if locked:
                 self.featured += 1
             if self.filt == 'locked' and not locked:
@@ -1211,7 +1281,7 @@ class Haul:
                 self.frames.append(Frame(src, st.st_size, False, src, dt,
                                          date_delta=timedelta(0), offset=rec_off))
                 continue
-            locked = is_locked(st)
+            locked = is_locked(src, st)
             if locked:
                 self.featured += 1
             # ExifPatchError (shot_tz with no recorded offset) aborts the run; a malformed
@@ -1445,7 +1515,7 @@ class Haul:
                     # In --local the folder is ours to modify, so clearing the protect bit
                     # here is in-bounds (unlike the read-only card); also lets rename/remove
                     # succeed. The Purple label is carried by f.locked into the sidecar.
-                    os.chflags(f.src, 0)
+                    clear_lock(f.src)
                 if f.date_delta or self.shot_tz is not None:
                     copy_file(f.src, f.dest, date_delta=f.date_delta,
                               target_offset=self.shot_tz)
@@ -1476,8 +1546,8 @@ class Haul:
             if f in self.conflicts or not os.path.exists(f.dest):
                 continue
             try:
-                if is_locked(os.stat(f.audio_src)):
-                    os.chflags(f.audio_src, 0)
+                if is_locked(f.audio_src, os.stat(f.audio_src)):
+                    clear_lock(f.audio_src)
                 if os.path.exists(f.audio_dest):
                     raise OSError('destination appeared after planning, not overwriting')
                 os.rename(f.audio_src, f.audio_dest)
@@ -1793,7 +1863,9 @@ def build_parser():
     ap.add_argument('extension', nargs='?', default=None, metavar='format',
                     help="raw/jpeg format to ingest (arw, cr3, nef, raf, dng, jpg); overrides "
                          "'format' in ~/.photohaul. No built-in default.")
-    ap.add_argument('--source', help='card root (default: auto-detect under /Volumes)')
+    ap.add_argument('--source', help='card root (default: auto-detect mounted media - '
+                                     'macOS /Volumes, Linux /media|/run/media|/mnt, '
+                                     'Windows drive letters)')
     ap.add_argument('--dest', default='.', help='destination dir (default: cwd)')
     sel = ap.add_mutually_exclusive_group()
     sel.add_argument('--locked', action='store_const', const='locked', dest='filter',

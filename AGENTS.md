@@ -19,8 +19,12 @@ The script is run from a destination folder; it's copied to `~/bin` by hand.
 
 ## Invariants — do not break these
 - **The card is read-only** *(card mode)*. It is never written to or modified. Lock
-  detection is `os.stat(...).st_flags & UF_IMMUTABLE` (the camera's in-camera protect bit;
-  verified on Sony and Fuji), a read. `main()` refuses outright if the destination
+  detection reads the FAT read-only attribute the camera's protect bit sets, surfaced
+  per-OS via the platform dispatch `is_locked(path, st)`: macOS `st_flags &
+  UF_IMMUTABLE` (verified on Sony and Fuji), Windows `st_file_attributes &
+  FILE_ATTRIBUTE_READONLY`; on Linux it is **not detected** (frames read unlocked — the
+  Purple workflow targets Lightroom, which isn't on Linux), all reads
+  (`docs/20260610_cross_platform_plan.md`). `main()` refuses outright if the destination
   resolves to a path on the card. `--local` mode uses no card; it **renames files in
   place** in the working folder (`docs/20260606_local_mode_plan.md`) — and refuses to
   run inside a `DCIM` tree, which would mean modifying card originals.
@@ -97,9 +101,11 @@ catalog-only develop edits — `--rewrite` updates an existing sidecar in place 
 create one either).
 Unlike `--rewrite`, it changes filenames (and, under a
 capture-time correction, EXIF). The in-camera protect bit survives a hand-copy off the
-card, so a camera-named locked frame is detected, **unlocked in place** (clearing the
-`uchg` flag — in-bounds here because the folder is ours, unlike the read-only card) and
-marked Purple, exactly as card mode copies-unlocked-and-Purples. Already-named files are
+card (macOS/Windows), so a camera-named locked frame is detected, **unlocked in place**
+(`clear_lock`, the per-OS counterpart to `is_locked` — in-bounds here because the folder
+is ours, unlike the read-only card) and marked Purple, exactly as card mode
+copies-unlocked-and-Purples. (On Linux locks aren't detected at all, so a `--local`
+frame is just renamed.) Already-named files are
 left strictly alone, lock bit included. Errors if combined with `--rewrite`, `--source`,
 or `--locked`/`--unlocked`. See `docs/20260606_local_mode_plan.md`.
 
@@ -127,8 +133,10 @@ or `--locked`/`--unlocked`. See `docs/20260606_local_mode_plan.md`.
 - **Also test against the real card or a scratch dir.** A dry run against the mounted
   card should report the right total/featured split; a real copy into a scratch
   dir verifies names, sidecars, unlocked copies, and that an immediate re-run
-  skips everything. Build a small fake card (`DCIM/<dir>/*.ARW`, `chflags uchg`
-  to simulate a lock) with `--source` when a controlled fixture is easier.
+  skips everything. Build a small fake card (`DCIM/<dir>/*.ARW`) with `--source` when a
+  controlled fixture is easier; simulate a lock with the test `set_lock` helper (macOS
+  `chflags uchg`, Windows read-only attr). Linux doesn't detect locks by design, so its
+  lock tests skip there.
 - There are samples in the samples/ folder of various image types for testing, but don't check them in
 
 ## Map of the source

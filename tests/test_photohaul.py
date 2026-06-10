@@ -29,6 +29,19 @@ SAMPLES = os.path.join(ROOT, 'samples')
 import photohaul as ph  # noqa: E402
 
 
+# Set the in-camera "protect" bit the way each OS exposes it, mirroring ph.clear_lock.
+# Linux deliberately doesn't detect locks (the lock->Purple workflow targets Lightroom,
+# which isn't on Linux), so set_lock is a no-op there and the integration lock tests skip.
+LOCK_TESTABLE = sys.platform in ('darwin', 'win32')
+
+
+def set_lock(path):
+    if sys.platform == 'darwin':
+        os.chflags(path, stat.UF_IMMUTABLE)
+    elif sys.platform == 'win32':
+        os.chmod(path, stat.S_IREAD)
+
+
 # ---------------------------------------------------------------------------
 # Synthetic Exif fixtures (no files committed)
 # ---------------------------------------------------------------------------
@@ -153,14 +166,11 @@ class TempCase(unittest.TestCase):
 
     def _cleanup(self):
         import shutil
-        # clear any immutable (uchg) flags a lock test set, so rmtree can remove them
-        if hasattr(os, 'chflags'):
-            for root, _dirs, files in os.walk(self.tmp):
-                for n in files:
-                    try:
-                        os.chflags(os.path.join(root, n), 0)
-                    except OSError:
-                        pass
+        # clear any protect bit a lock test set, so rmtree can remove the files
+        # (read-only blocks deletion on Windows too); ph.clear_lock is per-OS.
+        for root, _dirs, files in os.walk(self.tmp):
+            for n in files:
+                ph.clear_lock(os.path.join(root, n))
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def write(self, name, data):
@@ -1002,11 +1012,11 @@ class TestAudioNotes(TempCase):
 
 
 # ---------------------------------------------------------------------------
-# Lock -> unlock -> Purple (macOS UF_IMMUTABLE; skipped elsewhere)
+# Lock -> unlock -> Purple (real protect bit on macOS/Windows; Linux doesn't
+# detect locks by design, so these skip there)
 # ---------------------------------------------------------------------------
 
-@unittest.skipUnless(sys.platform == 'darwin' and hasattr(os, 'chflags'),
-                     'requires macOS chflags/UF_IMMUTABLE')
+@unittest.skipUnless(LOCK_TESTABLE, 'no settable protect bit on this platform/filesystem')
 class TestHaulLocked(TempCase):
     def _locked_card(self):
         card = os.path.join(self.tmp, 'card')
@@ -1014,9 +1024,9 @@ class TestHaulLocked(TempCase):
                             build_tiff(date='2026:05:26 14:00:24'))
         free = self.write(os.path.join('card', 'DCIM', '100MSDCF', 'FREE0002.ARW'),
                           build_tiff(date='2026:05:26 15:00:24'))
-        os.chflags(locked, stat.UF_IMMUTABLE)
-        if not ph.is_locked(os.stat(locked)):
-            self.skipTest('could not set UF_IMMUTABLE here')
+        set_lock(locked)
+        if not ph.is_locked(locked, os.stat(locked)):
+            self.skipTest('could not set the protect bit here')
         return card, locked, free
 
     def _haul(self, card, dest, filt='all'):
@@ -1030,10 +1040,10 @@ class TestHaulLocked(TempCase):
         silent(h.run)
         self.assertEqual(h.featured, 1)                                   # one locked frame seen
         locked_dest = os.path.join(dest, '20260526-140024_708.arw')
-        self.assertFalse(ph.is_locked(os.stat(locked_dest)))             # copy is unlocked
+        self.assertFalse(ph.is_locked(locked_dest, os.stat(locked_dest)))  # copy is unlocked
         self.assertEqual(ph.read_label(os.path.join(dest, '20260526-140024_708.xmp')), 'Purple')
         self.assertIsNone(ph.read_label(os.path.join(dest, '20260526-150024_708.xmp')))
-        self.assertTrue(ph.is_locked(os.stat(locked)))                   # card original untouched
+        self.assertTrue(ph.is_locked(locked, os.stat(locked)))           # card original untouched
 
     def test_filter_locked_only(self):
         card, _l, _f = self._locked_card()
@@ -1205,18 +1215,17 @@ class TestHaulErrors(TempCase):
 
 
 # ---------------------------------------------------------------------------
-# --local lock -> unlock -> Purple (macOS UF_IMMUTABLE; skipped elsewhere)
+# --local lock -> unlock -> Purple (real protect bit on macOS/Windows)
 # ---------------------------------------------------------------------------
 
-@unittest.skipUnless(sys.platform == 'darwin' and hasattr(os, 'chflags'),
-                     'requires macOS chflags/UF_IMMUTABLE')
+@unittest.skipUnless(LOCK_TESTABLE, 'no settable protect bit on this platform/filesystem')
 class TestHaulLocalLocked(TempCase):
     def test_locked_camera_file_renamed_unlocked_and_purple(self):
         dest = self.tmp
         src = self.write('LOCK0003.ARW', build_tiff())
-        os.chflags(src, stat.UF_IMMUTABLE)
-        if not ph.is_locked(os.stat(src)):
-            self.skipTest('could not set UF_IMMUTABLE here')
+        set_lock(src)
+        if not ph.is_locked(src, os.stat(src)):
+            self.skipTest('could not set the protect bit here')
         h = ph.Haul(card=None, ext='arw', dest_dir=dest, filt='all', dry_run=False,
                     rewrite=False, config=CONFIG, template=None, profile='default', local=True)
         silent(h.run)
@@ -1224,7 +1233,7 @@ class TestHaulLocalLocked(TempCase):
         self.assertFalse(os.path.exists(os.path.join(dest, 'LOCK0003.ARW')))     # renamed away
         renamed = os.path.join(dest, '20260526-140024_708.arw')
         self.assertTrue(os.path.exists(renamed))
-        self.assertFalse(ph.is_locked(os.stat(renamed)))                         # unlocked in place
+        self.assertFalse(ph.is_locked(renamed, os.stat(renamed)))                # unlocked in place
         self.assertEqual(ph.read_label(os.path.join(dest, '20260526-140024_708.xmp')), 'Purple')
 
 
