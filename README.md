@@ -2,64 +2,73 @@
 
 [![tests](https://github.com/uzi/photohaul/actions/workflows/test.yml/badge.svg)](https://github.com/uzi/photohaul/actions/workflows/test.yml)
 
-A fast, dependency-free CLI for ingesting photos off a camera card.
+A fast, dependency-free CLI that turns a card full of frames into a
+deadline-ready Lightroom shoot.
 
-photohaul copies raw files from a mounted card into the current folder and
-renames each to a stable, millisecond-precise name from its Exif capture time
-(`YYYYMMDD-hhmmss_mmm.ext`, e.g. `20260526-140024_708.ext`). Because the name
-comes only from the frame's own metadata, re-running on the same card simply
-skips whatever already landed.
+Built for press and sports shooting (but applicable beyond that), photohaul copies
+raw files off a mounted card and does the tedious prep on the way in: it renames each
+frame to its exact capture time (`YYYYMMDD-hhmmss_mmm.ext`, e.g.
+`20260406-123456_789.jpg`), takes the keepers you **flagged in-camera** and marks
+them Purple in Lightroom, and writes an AP-style caption plus the copyright and IPTC
+fields (credit, source, location, usage terms, keywords) a photo desk expects — all
+into an `.xmp` sidecar, so the raw stays a byte-exact clone of the card original.
 
-Frames you locked (protected) in-camera are detected, copied **unlocked**, and
-tagged with a Purple color label for Lightroom via an `.xmp` sidecar. In-camera
-**voice memos** (the sidecar `.WAV` Sony and Nikon record next to a frame) ride
-along, renamed to match their photo. **The card itself is never modified** —
-photohaul refuses outright to run with a destination on the card (and `--local`
-refuses to run inside a `DCIM` tree).
+In-camera **voice memos** ride along, renamed to match their photo. Re-runs are
+idempotent — the name comes only from the frame's own metadata, so running again
+just skips whatever already landed. And **the card itself is never modified**.
 
 ## Quick start
 
-Run it from the folder you want the photos copied *into*:
+Copy the script somewhere in your $PATH, then run it from the folder you want the photos copied *into*:
 
 ```sh
-cd ~/Photos/some-shoot          # the destination
+cd ~/Photos/some-shoot   # the destination
 photohaul arw            # copy every .ARW off the mounted card
-photohaul arw --dry-run  # ...or preview first, touching nothing
+photohaul arw --locked   # ... or just the frames you locked in-camera
 ```
 
 Set a default `format` in `~/.photohaul` (below) and you can drop the argument
 and just run `photohaul`.
 
-## Supported formats
-
-photohaul reads Exif natively — no exiftool, no dependencies:
-
-| Format | Camera | Where the Exif lives |
-|--------|--------|----------------------|
-| **ARW** / **NEF** / **DNG** | Sony / Nikon / Adobe·Ricoh | TIFF at byte zero |
-| **JPG** | any | APP1 segment, read directly |
-| **RAF** | Fuji | an embedded JPEG, read transparently |
-| **CR3** | Canon | an MP4-style container's `moov` metadata box |
-
-Pick the format with the `format` argument (e.g. `photohaul nef`) or set a
-default in `~/.photohaul`. The argument wins when both are present; there is no
-built-in default, so with neither set photohaul errors rather than guessing.
-
 ## Usage
 
-    photohaul [format] [--source PATH] [--dest PATH] [--local]
-              [--locked | --unlocked | --all]
-              [--dry-run] [--rewrite] [--init] [--profile NAME]
+    photohaul [format] [--source PATH] [--dest PATH]
+              [--locked | --unlocked | --all] [--dry-run]
+              [--rewrite] [--local] [--init] [--profile NAME]
 
-See `photohaul --help` for the full list of options and examples.
+Run from the destination folder, or point `--dest` at it. With no flags,
+photohaul copies every frame of the chosen format off the auto-detected card
+into that folder.
 
-## Metadata (copyright, creator, captions)
+| Flag | What it does |
+|------|--------------|
+| `format` | File type to ingest — `arw`, `cr3`, `nef`, `raf`, `dng`, or `jpg`. Overrides `format` in `~/.photohaul`; there is no built-in default. |
+| `--source PATH` | Card root to read from. Default: auto-detect the one mounted volume with a `DCIM/` folder under `/Volumes` (errors if there are zero or several). |
+| `--dest PATH` | Destination directory. Default: the current folder. |
+| `--locked` | Ingest only the frames you protected in-camera — your flagged keepers, copied unlocked and labelled Purple. |
+| `--unlocked` | Ingest only the unprotected frames. |
+| `--all` | Ingest everything (the default). |
+| `-n`, `--dry-run` | Scan and report exactly what would happen — copies, skips, sidecars, conflicts — but touch nothing. |
+| `--rewrite` | Refresh metadata on files **already in the destination**; no card, nothing copied. Merge-only — see *Refreshing metadata*, below. |
+| `--local` | Rename camera-named files **already in the destination** in place; no card, no copy — see *Rename in place*, below. |
+| `--init` | Scaffold a `photohaul.json` in the destination and exit (blank, or seeded from `--profile`) — see *Per-shoot setup*, below. |
+| `--profile NAME` | Apply a named rights preset from `~/.photohaul` — see *Rights & profiles*, below. |
+
+`--locked`, `--unlocked`, and `--all` are mutually exclusive. `--rewrite` and
+`--local` are card-free modes: they can't be combined with each other or with the
+filter flags, and `--local` also rejects `--source`. Run `photohaul --help` for
+this same list plus worked examples.
+
+## Rights & profiles — `~/.photohaul`
 
 photohaul writes all metadata to the `.xmp` sidecar — never the raw — so the
 copied file stays a byte-exact clone of the card original and re-runs stay
 idempotent. (The lone exception is an opt-in capture-time correction, below, which
 rewrites the copy's EXIF date/offset fields in place.) Lightroom reads these on
 import.
+
+Your identity and rights live in an optional `~/.photohaul` config file — set
+once and reused across every shoot.
 
 ### Rights
 
@@ -116,11 +125,16 @@ This is a one-time copy at `--init`; the JSON is the source of truth thereafter
 `credit`/`format` are read from the config). Bare `--init` still seeds from
 `[default]`.
 
+## Per-shoot setup — `photohaul.json`
+
+Everything specific to one shoot — the caption, the IPTC fields, and any
+capture-time correction — lives in a `photohaul.json` in the destination folder,
+auto-detected on ingest. Scaffold one with `photohaul --init` (blank, or seeded
+from a profile, above).
+
 ### Captions & IPTC fields
 
-Per-shoot caption and IPTC fields come from a `photohaul.json` in the
-destination folder, auto-detected on ingest. Scaffold one with `photohaul --init`
-(blank, or seeded from a profile, above):
+The keys you can fill:
 
 ```json
 {
@@ -200,7 +214,7 @@ except March–July spelled out); `credit` falls back to the config `credit`, th
 sentence and player IDs (e.g. "Jane Doe (7) goes up for a kill …") stay a manual
 Lightroom pass; photohaul writes only what's constant for the shoot.
 
-## Capture-time correction (clock drift & timezone)
+### Capture-time correction (clock drift & timezone)
 
 Two optional, composable keys in `photohaul.json` fix a wrong capture time. Both
 drive the destination filename, the caption date, and `{year}`, **and** rewrite
@@ -237,6 +251,8 @@ When both are set they compose (date fields shift by the sum; offsets set to
 > flag (a forgotten flag could silently rename everything). `--rewrite` ignores
 > both keys, since the destination files already carry the corrected time.
 
+## Refreshing metadata — `--rewrite`
+
 photohaul writes a sidecar only for files it just **placed** (copied or renamed) — never
 for a file already in the folder. Dropping even a minimal sidecar next to a raw you've
 already imported and edited in Lightroom makes Lightroom sync from that new (develop-less)
@@ -253,15 +269,15 @@ rewrite never adds or removes a label. An existing sidecar that can't be parsed 
 and left untouched, never overwritten. `--rewrite` cannot be combined with
 `--locked`/`--unlocked`.
 
-## `--local` — rename files already in a folder
+## Rename in place — `--local`
 
-For the "I copied a few frames off the card by hand" workflow (e.g. an X100VI or
-Ricoh GR), `photohaul --local raf` renames camera-named files **already in the
+For the "I copied a few frames off the card by hand" workflow (e.g. a personal
+camera), `photohaul --local` renames camera-named files **already in the
 destination** to the timestamp name, **in place** — no card, no copy:
 
 ```
 $ photohaul --local raf            # operates on the current folder (or --dest)
-DSCF1234.RAF  ->  20260501-123456_708.raf
+DSCF1234.RAF -> 20260501-123456_708.raf
 ```
 
 Files whose names already match the timestamp pattern are left **strictly untouched** —
@@ -291,6 +307,21 @@ carries no Exif, so a `time_shift`/`shot_tz` correction only changes its *name*,
 never its bytes, and it gets no `.xmp` sidecar of its own. Like the raw, it's
 idempotent (a same-name, same-size WAV is skipped) and never overwrites a
 different file at its name. `--rewrite` is metadata-only and ignores audio notes.
+
+## Supported formats
+
+photohaul reads Exif natively — no exiftool, no dependencies:
+
+| Format | Camera | Where the Exif lives |
+|--------|--------|----------------------|
+| **ARW** / **NEF** / **DNG** | Sony / Nikon / Adobe·Ricoh | TIFF at byte zero |
+| **JPG** | any | APP1 segment, read directly |
+| **RAF** | Fuji | an embedded JPEG, read transparently |
+| **CR3** | Canon | an MP4-style container's `moov` metadata box |
+
+Pick the format with the `format` argument (e.g. `photohaul nef`) or set a
+default in `~/.photohaul`. The argument wins when both are present; there is no
+built-in default, so with neither set photohaul errors rather than guessing.
 
 ## Requirements
 
