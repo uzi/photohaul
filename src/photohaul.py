@@ -890,6 +890,29 @@ def write_sidecar(sidecar, fields, merge):
 # ---------------------------------------------------------------------------
 
 CHUNK = 8 * 1024 * 1024
+PROBE = 64 * 1024     # bytes compared at each end by same_head_tail
+
+
+def same_head_tail(a, b, size):
+    """True if files a and b (each `size` bytes) match in their first and last
+    PROBE bytes - the identity check behind "a same-size file at a planned name
+    is this frame's own prior copy".
+
+    Size alone can lie: uncompressed raws are fixed-size, so two no-subsec frames
+    sharing a second also share a byte size, and a size-only answer silently drops
+    the second frame when the runs are split (partial-then-full, two cards). The
+    head covers the maker notes (shutter count etc.), the tail image data - either
+    differs between any two real frames. Files smaller than PROBE compare whole.
+    """
+    n = min(size, PROBE)
+    with open(a, 'rb') as fa, open(b, 'rb') as fb:
+        if fa.read(n) != fb.read(n):
+            return False
+        if size > n:
+            fa.seek(size - n)
+            fb.seek(size - n)
+            return fa.read(n) == fb.read(n)
+    return True
 
 
 def copy_file(src, dest, on_chunk=None, date_delta=timedelta(0), target_offset=None):
@@ -1060,6 +1083,8 @@ class Haul:
     audio_to_skip: list = field(default_factory=list)   # WAV already present (same size)
     audio_conflicts: list = field(default_factory=list)  # different file at the WAV name
     audio_placed: list = field(default_factory=list)    # WAVs we actually copied/renamed
+    sidecars_written: int = 0                       # sidecars written for placed files
+    sidecars_purple: int = 0                        # ... of which carry a Purple label
     _iptc: dict = field(default=None, init=False, repr=False)   # cached folder-constant fields
 
     # --- planning ------------------------------------------------------------
@@ -1220,20 +1245,34 @@ class Haul:
         """A collision-proof, idempotent destination stem for one card frame (card mode).
 
         The bare `base` is used only if no other frame this run claimed it and the dest
-        holds no *different* file there - a same-size file at that name is this frame's
-        own prior copy, so we keep the name and let classify skip it. Otherwise fall back
-        to the intrinsic `-dscnumber` suffix, extending (`-2`, `-3`, ...) until free. The
-        choice depends only on the frame and the on-disk state, never on scan order or
-        which other frames are present, so a different photo sharing a timestamp is
-        imported under its own name instead of duplicating one frame and conflicting the
-        other. `used_names` maps an assigned stem to the src that claimed it this run.
+        holds no *different* file there - a same-size file at that name whose head/tail
+        bytes also match is this frame's own prior copy, so we keep the name and let
+        classify skip it. Otherwise fall back to the intrinsic `-dscnumber` suffix,
+        extending (`-2`, `-3`, ...) until free. The choice depends only on the frame and
+        the on-disk state, never on scan order or which other frames are present, so a
+        different photo sharing a timestamp is imported under its own name instead of
+        duplicating one frame and conflicting the other. `used_names` maps an assigned
+        stem to the src that claimed it this run.
         """
         def free(stem):
             if used_names.get(stem, src) != src:
                 return False                       # another frame this run took this stem
             cand = os.path.join(self.dest_dir, stem + '.' + self.ext)
             try:
-                return not os.path.exists(cand) or os.path.getsize(cand) == size
+                if not os.path.exists(cand):
+                    return True
+                if os.path.getsize(cand) != size:
+                    return False
+                # Same size at the name: size alone is fallible (uncompressed raws are
+                # fixed-size, so two no-subsec frames in the same second match), so
+                # confirm with a head/tail byte probe - exact, because with no
+                # correction the copy is byte-identical to the card original. Under a
+                # correction the copy's date fields differ from the card by design and
+                # a cheap probe can't tell the patch from a different frame, so size
+                # keeps the (pre-probe) answer there.
+                if self.time_shift or self.shot_tz is not None:
+                    return True
+                return same_head_tail(src, cand, size)
             except OSError:
                 return False
         if not free(base):
@@ -1342,7 +1381,9 @@ class Haul:
     # --- doing ---------------------------------------------------------------
 
     def copy(self):
-        """Copy every to-copy frame (and its audio note), updating a live progress display."""
+        """Copy every to-copy frame (and its audio note), updating a live progress
+        display. Each frame's sidecar is written the moment its copy lands
+        (_sidecar_placed), so an interrupted run never strands a placed file."""
         progress = Progress(len(self.to_copy) + len(self.audio_to_copy),
                             self.copy_bytes + self.audio_copy_bytes)
         try:
@@ -1355,6 +1396,7 @@ class Haul:
                                        % (os.path.basename(f.dest), e))
                     continue
                 self.placed.append(f)
+                self._sidecar_placed(f)
                 progress.file_done()
             self._copy_audio(progress)
         finally:
@@ -1367,9 +1409,11 @@ class Haul:
         """Copy each planned voice-memo WAV next to the photo it belongs to. The WAV rides
         along by name only - no EXIF patch, no sidecar. We place it only when the photo's
         dest exists (placed this run or already there), so a failed photo copy never strands
-        a lone audio note. copy_file's no-clobber guard protects an unexpected occupant."""
+        a lone audio note - and never for a conflicted photo, whose dest exists but holds
+        some *other* frame the memo doesn't belong to. copy_file's no-clobber guard
+        protects an unexpected occupant."""
         for f in self.audio_to_copy:
-            if not os.path.exists(f.dest):
+            if f in self.conflicts or not os.path.exists(f.dest):
                 continue
             try:
                 copy_file(f.audio_src, f.audio_dest, on_chunk=progress.tick)
@@ -1413,6 +1457,7 @@ class Haul:
                 else:
                     os.rename(f.src, f.dest)
                 self.placed.append(f)
+                self._sidecar_placed(f)
                 renamed += 1
             except OSError as e:
                 self.errors.append('%s: rename failed (%s)'
@@ -1424,10 +1469,11 @@ class Haul:
         """--local: rename each planned voice-memo WAV to match its photo. Plain os.rename
         (the WAV has no EXIF to patch, even under a capture-time correction - only its name
         tracks the photo). A locked WAV is unlocked first (the folder is ours), and we only
-        move it once the photo's dest exists, so a failed photo rename leaves the pair intact.
+        move it once the photo's dest exists - and isn't a conflict holding some other
+        frame - so a failed photo rename leaves the pair intact.
         """
         for f in self.audio_to_copy:
-            if not os.path.exists(f.dest):
+            if f in self.conflicts or not os.path.exists(f.dest):
                 continue
             try:
                 if is_locked(os.stat(f.audio_src)):
@@ -1530,29 +1576,40 @@ class Haul:
         # create-if-absent: an existing sidecar is left untouched.
         return None if exists else bool(fields['label'])
 
-    def write_metadata(self):
-        """Write sidecars (create-if-absent for new files, merge-only under --rewrite).
-        Returns counts.
+    def _sidecar_placed(self, f):
+        """Write one just-placed frame's sidecar (create-if-absent), updating counts.
 
-        We only ever sidecar files we just placed (copied/renamed), never a file already
-        in the folder. Dropping even a minimal sidecar next to a raw already imported and
-        edited in Lightroom makes LR sync from the new (develop-less) sidecar and revert
-        catalog-only edits, so already-present files are left strictly alone. --rewrite is
-        the exception and is merge-only: it updates sidecars that already exist (preserving
-        develop edits) and skips files that have none (enforced in write_sidecar).
-        Conflicts and copy failures are excluded - we never attach metadata to a file we
-        did not write.
+        Called per file, right after its copy/rename lands, rather than batched after
+        the whole copy phase: an interrupted run (ctrl-C, an ExifPatchError on a later
+        file) would otherwise strand every file placed so far sidecar-less *forever* -
+        a re-run skips them as already present, and --rewrite is merge-only - losing
+        e.g. a locked frame's Purple label. We still only ever sidecar files we just
+        placed, never a file already in the folder: dropping even a minimal sidecar
+        next to a raw already imported and edited in Lightroom makes LR sync from the
+        new (develop-less) sidecar and revert catalog-only edits.
+        """
+        try:
+            if write_sidecar(f.sidecar, self.fields_for(f), merge=False):
+                self.sidecars_written += 1
+                if f.locked:
+                    self.sidecars_purple += 1
+        except SidecarParseError as e:
+            self.errors.append('%s: %s' % (os.path.basename(f.sidecar), e))
+
+    def write_metadata(self):
+        """--rewrite's merge pass over the scanned destination files. Returns counts.
+
+        Merge-only: updates sidecars that already exist (preserving develop edits) and
+        skips files that have none (enforced in write_sidecar) - never creating a
+        develop-less sidecar that would make Lightroom revert catalog-only edits. An
+        unparseable sidecar is reported and left untouched. Card/--local runs don't
+        come through here: each placed file's sidecar is written as it lands
+        (_sidecar_placed), so an interruption can't strand placed files sidecar-less.
         """
         written = purple = 0
-        if self.rewrite:
-            targets = self.frames        # merge-only; write_sidecar skips any without a sidecar
-        else:
-            targets = self.placed        # only files we just copied/renamed
-        for f in targets:
-            if not os.path.exists(f.dest):
-                continue   # belt-and-suspenders; placed/to_skip dests exist
+        for f in self.frames:
             try:
-                if write_sidecar(f.sidecar, self.fields_for(f), merge=self.rewrite):
+                if write_sidecar(f.sidecar, self.fields_for(f), merge=True):
                     written += 1
                     if f.locked:
                         purple += 1
@@ -1583,12 +1640,11 @@ class Haul:
             return self._exit_code()
 
         progress = self.copy()
-        written, purple = self.write_metadata()
         print('Done: copied %d (%s in %s, %.0f MB/s), skipped %d. '
               'Sidecars: %d written (%d Purple).'
               % (progress.done_files, human_bytes(progress.done_bytes),
                  fmt_eta(progress.elapsed), progress.rate_mb,
-                 len(self.to_skip), written, purple))
+                 len(self.to_skip), self.sidecars_written, self.sidecars_purple))
         self._report_audio('copied')
         if self.errors:
             print('  %d error(s):' % len(self.errors))
@@ -1612,10 +1668,10 @@ class Haul:
             return self._exit_code()
 
         renamed = self.relocate()
-        written, purple = self.write_metadata()
         print('Done: renamed %d (%d unlocked), skipped %d already named. '
               'Sidecars: %d written (%d Purple).'
-              % (renamed, self.featured, len(self.to_skip), written, purple))
+              % (renamed, self.featured, len(self.to_skip),
+                 self.sidecars_written, self.sidecars_purple))
         self._report_audio('renamed')
         if self.errors:
             print('  %d error(s):' % len(self.errors))
@@ -1726,9 +1782,9 @@ def build_parser():
             '\n'
             'invariants:\n'
             '  - The card is read-only; it is never written to or modified.\n'
-            '  - A same-named file of matching size is skipped (idempotent re-run); a\n'
-            '    different file sharing a timestamp is imported under a -NNNNN suffix,\n'
-            '    never overwritten.\n'
+            '  - A copy that already landed is recognized (size + head/tail bytes) and\n'
+            '    skipped (idempotent re-run); a different file sharing a timestamp is\n'
+            '    imported under a -NNNNN suffix, never overwritten.\n'
             '  - Sidecars are written only for files just copied/renamed; a file\n'
             '    already in the folder is left alone (never given a develop-less\n'
             '    sidecar that would make Lightroom revert catalog-only edits).\n'
@@ -1787,6 +1843,13 @@ def main():
         if args.filter != 'all':
             sys.exit("Error: --local cannot be combined with --locked/--unlocked "
                      "(no lock status without a card)")
+        # --local renames files and clears protect bits in place. Inside a DCIM tree
+        # that means modifying camera originals on the card itself - read-only
+        # territory. Refuse; the workflow is to copy the files off the card first.
+        if any(p.upper() == 'DCIM' for p in os.path.realpath(dest_dir).split(os.sep)):
+            sys.exit("Error: %s is inside a DCIM tree (a camera card?). --local "
+                     "renames files in place; copy them off the card first."
+                     % dest_dir)
 
     template = load_template(dest_dir)
     profile = args.profile or (template or {}).get('profile') or DEFAULT_PROFILE
@@ -1823,6 +1886,13 @@ def main():
             sys.exit("Error: destination %s is not a directory" % dest_dir)
     else:
         card = find_card(args.source)
+        # The card is read-only: a destination on the card would put .partials,
+        # copies, and sidecars onto it. Refuse outright, dry run included.
+        # (realpath both sides so /var vs /private/var style aliases can't slip by.)
+        real_card = os.path.realpath(card)
+        if os.path.commonpath([real_card, os.path.realpath(dest_dir)]) == real_card:
+            sys.exit("Error: destination %s is on the card %s; the card is "
+                     "read-only. Choose a destination off the card." % (dest_dir, card))
         if not args.dry_run and not os.path.isdir(dest_dir):
             sys.exit("Error: destination %s is not a directory" % dest_dir)
         if not scan_source(card, ext):

@@ -13,7 +13,9 @@ skips whatever already landed.
 Frames you locked (protected) in-camera are detected, copied **unlocked**, and
 tagged with a Purple color label for Lightroom via an `.xmp` sidecar. In-camera
 **voice memos** (the sidecar `.WAV` Sony and Nikon record next to a frame) ride
-along, renamed to match their photo. **The card itself is never modified.**
+along, renamed to match their photo. **The card itself is never modified** —
+photohaul refuses outright to run with a destination on the card (and `--local`
+refuses to run inside a `DCIM` tree).
 
 ## Quick start
 

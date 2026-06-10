@@ -592,6 +592,22 @@ class TestExifPatch(TempCase):
 # ---------------------------------------------------------------------------
 
 class TestCopyFile(TempCase):
+    def test_same_head_tail_probe(self):
+        # Large enough that the head and tail windows don't overlap, so each is
+        # genuinely probed on its own.
+        size = 2 * ph.PROBE + 1000
+        base = bytearray(os.urandom(size))
+        a = self.write('a.bin', bytes(base))
+        self.assertTrue(ph.same_head_tail(a, self.write('same.bin', bytes(base)), size))
+        head = bytearray(base); head[10] ^= 0xFF
+        self.assertFalse(ph.same_head_tail(a, self.write('head.bin', bytes(head)), size))
+        tail = bytearray(base); tail[-10] ^= 0xFF
+        self.assertFalse(ph.same_head_tail(a, self.write('tail.bin', bytes(tail)), size))
+        # tiny files compare whole
+        s = self.write('s1.bin', b'abc')
+        self.assertTrue(ph.same_head_tail(s, self.write('s2.bin', b'abc'), 3))
+        self.assertFalse(ph.same_head_tail(s, self.write('s3.bin', b'abd'), 3))
+
     def test_byte_exact_copy(self):
         src = self.write('src.arw', build_tiff())
         dest = os.path.join(self.tmp, 'dest.arw')
@@ -702,6 +718,34 @@ class TestHaulCardMode(TempCase):
         arw = os.path.join(dest, '20260526-150024_708.arw')
         self.assertTrue(os.path.exists(arw))
         self.assertEqual(ph.read_exif_datetime(arw)[0], '2026:05:26 15:00:24')
+        # re-run with the same correction stays idempotent: the patched copy's bytes
+        # differ from the card original by design, so size (not the byte probe)
+        # decides "already present" under a correction
+        h2 = self._haul(card, dest, time_shift=timedelta(hours=1))
+        silent(h2.run)
+        self.assertEqual(len(h2.to_copy), 0)
+        self.assertEqual(len(h2.to_skip), 1)
+
+    def test_interrupted_run_keeps_placed_sidecars(self):
+        # An ExifPatchError on a later file aborts the run mid-copy; every file placed
+        # before it must already have its sidecar. (A re-run skips placed files and
+        # --rewrite is merge-only, so a sidecar missed here would be missed forever.)
+        card = os.path.join(self.tmp, 'card')
+        self.write(os.path.join('card', 'DCIM', '100MSDCF', 'A0001.ARW'),
+                   build_tiff(date='2026:05:26 14:00:24', subsec='708'))
+        # 21-byte DateTimeOriginal field (trailing space): reads/names fine, but the
+        # in-place patcher rejects the unexpected width once this file's copy starts.
+        self.write(os.path.join('card', 'DCIM', '100MSDCF', 'B0002.ARW'),
+                   build_tiff(date='2026:05:26 14:00:25 ', subsec='708'))
+        dest = os.path.join(self.tmp, 'dest'); os.makedirs(dest)
+        h = self._haul(card, dest, time_shift=timedelta(hours=1))
+        with self.assertRaises(ph.ExifPatchError):
+            silent(h.run)
+        # the first frame landed *with* its sidecar before the abort
+        self.assertTrue(os.path.exists(os.path.join(dest, '20260526-150024_708.arw')))
+        self.assertTrue(os.path.exists(os.path.join(dest, '20260526-150024_708.xmp')))
+        # the failing frame stranded nothing
+        self.assertFalse(os.path.exists(os.path.join(dest, '20260526-150025_708.arw')))
 
 
 class TestHaulCollision(TempCase):
@@ -752,6 +796,29 @@ class TestHaulCollision(TempCase):
         self.assertEqual(sorted(os.listdir(dest)), first)   # nothing added on re-run
         self.assertEqual(len(h2.to_copy), 0)
         self.assertEqual(len(h2.to_skip), 2)
+
+    def test_same_size_same_stamp_cross_run_imports_both(self):
+        # Two *different* frames sharing both the timestamp (no subsec) AND the byte
+        # size (uncompressed raws are fixed-size), imported across separate runs/cards.
+        # Size alone used to call the second frame "already present" and silently drop
+        # it; the head/tail byte probe tells them apart.
+        A = build_tiff(date='2026:05:26 14:00:24', subsec=None) + b'A' * 4096
+        B = build_tiff(date='2026:05:26 14:00:24', subsec=None) + b'B' * 4096
+        self.assertEqual(len(A), len(B))
+        card1 = os.path.join(self.tmp, 'card1')
+        self.write(os.path.join('card1', 'DCIM', '100MSDCF', 'DSC00001.ARW'), A)
+        card2 = os.path.join(self.tmp, 'card2')
+        self.write(os.path.join('card2', 'DCIM', '100MSDCF', 'DSC00002.ARW'), B)
+        dest = os.path.join(self.tmp, 'dest'); os.makedirs(dest)
+        silent(self._haul(card1, dest).run)
+        silent(self._haul(card2, dest).run)
+        self.assertEqual(rb(os.path.join(dest, '20260526-140024.arw')), A)         # kept
+        self.assertEqual(rb(os.path.join(dest, '20260526-140024-00002.arw')), B)   # imported
+        # and re-running card2 still skips its own copy (the probe matches it)
+        h3 = self._haul(card2, dest)
+        silent(h3.run)
+        self.assertEqual(len(h3.to_copy), 0)
+        self.assertEqual(len(h3.to_skip), 1)
 
 
 class TestHaulLocalMode(TempCase):
@@ -877,6 +944,22 @@ class TestAudioNotes(TempCase):
                          b'someone elses audio')                        # untouched
         self.assertEqual(len(h.audio_conflicts), 1)
         self.assertEqual(rc, 1)                                         # conflict -> non-zero
+
+    def test_wav_not_attached_to_conflicted_photo(self):
+        # A different file lands on the photo's planned name between scan and classify
+        # (the plan->copy race): the photo conflicts, and its memo must not be copied
+        # to a name that now belongs to some other frame.
+        card = self._card()
+        dest = os.path.join(self.tmp, 'dest'); os.makedirs(dest)
+        h = self._haul(card, dest)
+        h.scan()
+        self.write(os.path.join('dest', '20260526-140024_708.arw'), b'late arrival')
+        h.classify()
+        self.assertEqual(len(h.conflicts), 1)
+        self.assertIn(h.conflicts[0], h.audio_to_copy)   # the WAV was planned...
+        silent(h.copy)
+        self.assertFalse(os.path.exists(os.path.join(dest, '20260526-140024_708.wav')))
+        self.assertEqual(h.audio_placed, [])             # ...but never placed
 
     def test_no_wav_means_no_audio_activity(self):
         card = self._card(wav=False)
@@ -1285,6 +1368,29 @@ class TestMain(TempCase):
     def test_no_format_anywhere_exits(self):
         with self.assertRaises(SystemExit):
             self._run([], config={})        # no positional, no 'format' in config
+
+    # --- read-only-card guards ------------------------------------------------
+
+    def test_dest_on_card_exits(self):
+        # The card is read-only: a destination on the card itself must be refused
+        # before anything runs (it would put .partials and sidecars on the card).
+        card = self._card()
+        dest = os.path.join(card, 'haul'); os.makedirs(dest)
+        with self.assertRaises(SystemExit):
+            self._run(['arw', '--source', card, '--dest', dest])
+        self.assertEqual(os.listdir(dest), [])     # nothing landed on the card
+
+    def test_dest_is_card_root_exits(self):
+        card = self._card()
+        with self.assertRaises(SystemExit):
+            self._run(['arw', '--source', card, '--dest', card])
+
+    def test_local_inside_dcim_tree_exits(self):
+        # --local renames and unlocks in place; pointed inside a DCIM tree (i.e. at
+        # the card itself) that would modify camera originals, so it must refuse.
+        folder = os.path.join(self.tmp, 'DCIM', '100MSDCF'); os.makedirs(folder)
+        with self.assertRaises(SystemExit):
+            self._run(['arw', '--local', '--dest', folder])
 
     # --- config/template resolution through to the copy ----------------------
 

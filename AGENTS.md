@@ -20,15 +20,20 @@ The script is run from a destination folder; it's copied to `~/bin` by hand.
 ## Invariants — do not break these
 - **The card is read-only** *(card mode)*. It is never written to or modified. Lock
   detection is `os.stat(...).st_flags & UF_IMMUTABLE` (the camera's in-camera protect bit;
-  verified on Sony and Fuji), a read. `--local` mode uses no card; it **renames files in
-  place** in the working folder (`docs/20260606_local_mode_plan.md`).
+  verified on Sony and Fuji), a read. `main()` refuses outright if the destination
+  resolves to a path on the card. `--local` mode uses no card; it **renames files in
+  place** in the working folder (`docs/20260606_local_mode_plan.md`) — and refuses to
+  run inside a `DCIM` tree, which would mean modifying card originals.
 - **Re-runs are idempotent.** Card mode: destination names derive purely from intrinsic
   capture time, a present file of matching size is skipped. Two frames sharing a timestamp
-  (e.g. a no-subsec burst, or two cards) are disambiguated by a size-aware `-dscnumber`
-  suffix (`Haul._unique_base`): a same-size file at a name is that frame's own prior copy
-  (kept, skipped), a *different* file forces the suffix - so a colliding photo is imported
-  under its own name, never overwriting and never duplicating, idempotent across partial
-  and repeat runs. `--local`: a file whose name already matches the timestamp
+  (e.g. a no-subsec burst, or two cards) are disambiguated by a `-dscnumber`
+  suffix (`Haul._unique_base`): a file at a name matching in size *and* in head/tail
+  bytes (`same_head_tail` — size alone lies for fixed-size uncompressed raws) is that
+  frame's own prior copy (kept, skipped), a *different* file forces the suffix - so a
+  colliding photo is imported under its own name, never overwriting and never
+  duplicating, idempotent across partial and repeat runs. (Under a capture-time
+  correction the copy's bytes legitimately differ from the card, so there the match is
+  size-only, as before — the probe can't tell the patch from a different frame.) `--local`: a file whose name already matches the timestamp
   pattern (`_STAMP_RE`) is left alone, so re-runs only touch newly-added camera files.
   Anything that makes names depend on extrinsic input must be deterministic across runs
   (see capture-time offset).
@@ -39,7 +44,9 @@ The script is run from a destination folder; it's copied to `~/bin` by hand.
   crash-safe copy-patch-replace. If you add another exception, justify it and document it
   here.
 - **Sidecars are written only for files we just placed** (copied/renamed); a file
-  already in the folder never gets a freshly-created sidecar. Creating a develop-less
+  already in the folder never gets a freshly-created sidecar. Each sidecar is written
+  the moment its file lands (not batched after the copy phase), so an interrupted run
+  never strands placed files sidecar-less — a re-run would skip them forever. Creating a develop-less
   sidecar next to a raw already imported and edited in Lightroom makes LR sync from it
   and revert catalog-only edits, so already-present files are left strictly alone.
   `--rewrite` is **merge-only**: it merges photohaul's fields into a sidecar that
